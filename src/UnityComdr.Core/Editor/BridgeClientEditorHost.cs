@@ -1,0 +1,291 @@
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
+using UnityComdr.Models;
+
+namespace UnityComdr.Editor;
+
+/// <summary>
+/// Live <see cref="IEditorHost"/> that forwards every call to the Unity Editor TCP bridge.
+/// Used when the Editor package bridge is running; same handlers as headless path.
+/// </summary>
+public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
+{
+    private readonly int _port;
+    private TcpClient? _client;
+    private StreamReader? _reader;
+    private StreamWriter? _writer;
+    private readonly object _gate = new();
+
+    public BridgeClientEditorHost(int port = EditorHostFactory.DefaultLiveBridgePort)
+    {
+        _port = port;
+    }
+
+    public bool TryConnect(TimeSpan timeout)
+    {
+        try
+        {
+            var client = new TcpClient();
+            var ar = client.BeginConnect("127.0.0.1", _port, null, null);
+            if (!ar.AsyncWaitHandle.WaitOne(timeout))
+            {
+                try { client.Close(); } catch { /* ignore */ }
+                return false;
+            }
+            client.EndConnect(ar);
+            var stream = client.GetStream();
+            stream.ReadTimeout = 15000;
+            stream.WriteTimeout = 15000;
+            _client = client;
+            _reader = new StreamReader(stream, Encoding.UTF8, false, 4096, leaveOpen: true);
+            _writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
+            var pong = Call(BridgeProtocol.Methods.Ping, null);
+            return pong.Ok;
+        }
+        catch
+        {
+            Dispose();
+            return false;
+        }
+    }
+
+    public void Dispose()
+    {
+        try { _writer?.Dispose(); } catch { /* ignore */ }
+        try { _reader?.Dispose(); } catch { /* ignore */ }
+        try { _client?.Dispose(); } catch { /* ignore */ }
+        _writer = null;
+        _reader = null;
+        _client = null;
+    }
+
+    private BridgeProtocol.Response Call(string method, Dictionary<string, object?>? args)
+    {
+        lock (_gate)
+        {
+            if (_writer == null || _reader == null)
+                throw new InvalidOperationException("Live bridge not connected.");
+
+            var req = new BridgeProtocol.Request
+            {
+                Method = method,
+                Args = args?.ToDictionary(
+                    kv => kv.Key,
+                    kv => JsonSerializer.SerializeToElement(kv.Value, BridgeProtocol.JsonOptions))
+            };
+            var line = JsonSerializer.Serialize(req, BridgeProtocol.JsonOptions);
+            _writer.WriteLine(line);
+            var responseLine = _reader.ReadLine()
+                ?? throw new IOException("Live bridge closed the connection.");
+            var resp = JsonSerializer.Deserialize<BridgeProtocol.Response>(responseLine, BridgeProtocol.JsonOptions)
+                ?? throw new InvalidOperationException("Invalid bridge response.");
+            if (!resp.Ok)
+                throw new InvalidOperationException(resp.Error ?? "Bridge error");
+            return resp;
+        }
+    }
+
+    private T Result<T>(BridgeProtocol.Response resp)
+    {
+        if (resp.Result is null || resp.Result.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            return default!;
+        return resp.Result.Value.Deserialize<T>(BridgeProtocol.JsonOptions)!;
+    }
+
+    private static Dictionary<string, object?> A(params (string k, object? v)[] pairs)
+    {
+        var d = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, v) in pairs) d[k] = v;
+        return d;
+    }
+
+    // --- Console ---
+    public IReadOnlyList<ConsoleLogEntry> GetConsoleLogs() =>
+        Result<List<ConsoleLogEntry>>(Call(BridgeProtocol.Methods.GetConsoleLogs, null)) ?? new();
+
+    public void ClearConsole() => Call(BridgeProtocol.Methods.ClearConsole, null);
+
+    public void AddConsoleLog(ConsoleLogEntry entry) =>
+        Call(BridgeProtocol.Methods.AddConsoleLog, A(("entry", entry)));
+
+    // --- Editor ---
+    public EditorState GetState() =>
+        Result<EditorState>(Call(BridgeProtocol.Methods.GetState, null)) ?? new();
+
+    public void SetCompiling(bool compiling) { /* Unity owns compile state */ }
+
+    public void RequestScriptCompile() => Call(BridgeProtocol.Methods.RequestCompile, null);
+
+    public void SetPlayMode(bool playing, bool paused = false) =>
+        Call(BridgeProtocol.Methods.SetPlayMode, A(("playing", playing), ("paused", paused)));
+
+    public void StepPlayModeFrame() => Call(BridgeProtocol.Methods.StepPlayMode, null);
+
+    public SelectionState GetSelection() =>
+        Result<SelectionState>(Call(BridgeProtocol.Methods.SelectionGet, null)) ?? new();
+
+    public void SetSelection(IReadOnlyList<string>? gameObjectIds = null, IReadOnlyList<string>? assetPaths = null) =>
+        Call(BridgeProtocol.Methods.SelectionSet, A(("gameObjectIds", gameObjectIds), ("assetPaths", assetPaths)));
+
+    // --- Scripts ---
+    public IReadOnlyList<string> ListScripts(string? underPath = null) =>
+        Result<List<string>>(Call(BridgeProtocol.Methods.ScriptList, A(("underPath", underPath)))) ?? new();
+
+    public string? ReadScript(string path) =>
+        Result<string?>(Call(BridgeProtocol.Methods.ScriptRead, A(("path", path))));
+
+    public void WriteScript(string path, string content) =>
+        Call(BridgeProtocol.Methods.ScriptWrite, A(("path", path), ("content", content)));
+
+    public bool DeleteScript(string path) =>
+        Result<bool>(Call(BridgeProtocol.Methods.ScriptDelete, A(("path", path))));
+
+    // --- Scenes ---
+    public SceneData GetActiveScene() =>
+        Result<SceneData>(Call(BridgeProtocol.Methods.SceneGet, null)) ?? new();
+
+    public IReadOnlyList<SceneData> ListScenes() =>
+        Result<List<SceneData>>(Call(BridgeProtocol.Methods.SceneList, null)) ?? new();
+
+    public IReadOnlyList<SceneData> ListOpenedScenes() =>
+        Result<List<SceneData>>(Call(BridgeProtocol.Methods.SceneListOpened, null)) ?? new();
+
+    public SceneData CreateScene(string path, string? name = null) =>
+        Result<SceneData>(Call(BridgeProtocol.Methods.SceneCreate, A(("path", path), ("name", name)))) ?? new();
+
+    public SceneData OpenScene(string path, bool additive = false) =>
+        Result<SceneData>(Call(BridgeProtocol.Methods.SceneOpen, A(("path", path), ("additive", additive)))) ?? new();
+
+    public void SaveScene(string? path = null) =>
+        Call(BridgeProtocol.Methods.SceneSave, A(("path", path)));
+
+    public bool UnloadScene(string path) =>
+        Result<bool>(Call(BridgeProtocol.Methods.SceneUnload, A(("path", path))));
+
+    public bool SetActiveScene(string path) =>
+        Result<bool>(Call(BridgeProtocol.Methods.SceneSetActive, A(("path", path))));
+
+    // --- GameObjects ---
+    public GameObjectData? FindGameObject(string idOrPath) =>
+        Result<GameObjectData?>(Call(BridgeProtocol.Methods.GoFind, A(("idOrPath", idOrPath))));
+
+    public IReadOnlyList<GameObjectData> FindGameObjects(string? name = null, string? tag = null, string? componentType = null) =>
+        Result<List<GameObjectData>>(Call(BridgeProtocol.Methods.GoFindMany, A(("name", name), ("tag", tag), ("componentType", componentType)))) ?? new();
+
+    public IReadOnlyList<GameObjectData> GetAllGameObjects() =>
+        Result<List<GameObjectData>>(Call(BridgeProtocol.Methods.GoAll, null)) ?? new();
+
+    public GameObjectData CreateGameObject(string name, string? parentIdOrPath = null, string? primitiveType = null) =>
+        Result<GameObjectData>(Call(BridgeProtocol.Methods.GoCreate, A(("name", name), ("parent", parentIdOrPath), ("primitive", primitiveType)))) ?? new();
+
+    public bool DeleteGameObject(string idOrPath) =>
+        Result<bool>(Call(BridgeProtocol.Methods.GoDelete, A(("idOrPath", idOrPath))));
+
+    public GameObjectData? DuplicateGameObject(string idOrPath, string? newName = null) =>
+        Result<GameObjectData?>(Call(BridgeProtocol.Methods.GoDuplicate, A(("idOrPath", idOrPath), ("newName", newName))));
+
+    public bool SetParent(string idOrPath, string? newParentIdOrPath) =>
+        Result<bool>(Call(BridgeProtocol.Methods.GoSetParent, A(("idOrPath", idOrPath), ("parent", newParentIdOrPath))));
+
+    public bool SetTransform(string idOrPath, Vector3? position = null, Vector3? rotation = null, Vector3? scale = null) =>
+        Result<bool>(Call(BridgeProtocol.Methods.GoSetTransform, A(("idOrPath", idOrPath), ("position", position), ("rotation", rotation), ("scale", scale))));
+
+    public bool SetActive(string idOrPath, bool active) =>
+        Result<bool>(Call(BridgeProtocol.Methods.GoSetActive, A(("idOrPath", idOrPath), ("active", active))));
+
+    public bool RenameGameObject(string idOrPath, string newName) =>
+        Result<bool>(Call(BridgeProtocol.Methods.GoRename, A(("idOrPath", idOrPath), ("newName", newName))));
+
+    public bool SetTag(string idOrPath, string tag) =>
+        Result<bool>(Call(BridgeProtocol.Methods.GoSetTag, A(("idOrPath", idOrPath), ("tag", tag))));
+
+    public bool SetLayer(string idOrPath, int layer) =>
+        Result<bool>(Call(BridgeProtocol.Methods.GoSetLayer, A(("idOrPath", idOrPath), ("layer", layer))));
+
+    // --- Components ---
+    public bool AddComponent(string idOrPath, string typeName, Dictionary<string, object?>? properties = null) =>
+        Result<bool>(Call(BridgeProtocol.Methods.CompAdd, A(("idOrPath", idOrPath), ("typeName", typeName), ("properties", properties))));
+
+    public bool RemoveComponent(string idOrPath, string typeName) =>
+        Result<bool>(Call(BridgeProtocol.Methods.CompRemove, A(("idOrPath", idOrPath), ("typeName", typeName))));
+
+    public bool ModifyComponent(string idOrPath, string typeName, Dictionary<string, object?> properties) =>
+        Result<bool>(Call(BridgeProtocol.Methods.CompModify, A(("idOrPath", idOrPath), ("typeName", typeName), ("properties", properties))));
+
+    public ComponentData? GetComponent(string idOrPath, string typeName) =>
+        Result<ComponentData?>(Call(BridgeProtocol.Methods.CompGet, A(("idOrPath", idOrPath), ("typeName", typeName))));
+
+    public IReadOnlyList<string> ListComponentTypes(string? filter = null) =>
+        Result<List<string>>(Call(BridgeProtocol.Methods.CompListTypes, A(("filter", filter)))) ?? new();
+
+    // --- Assets ---
+    public IReadOnlyList<AssetRecord> FindAssets(string? filter = null, string? kind = null) =>
+        Result<List<AssetRecord>>(Call(BridgeProtocol.Methods.AssetsFind, A(("filter", filter), ("kind", kind)))) ?? new();
+
+    public MaterialData CreateMaterial(string path, string? color = null, string? shader = null) =>
+        Result<MaterialData>(Call(BridgeProtocol.Methods.MaterialCreate, A(("path", path), ("color", color), ("shader", shader)))) ?? new();
+
+    public bool AssignMaterial(string gameObjectIdOrPath, string materialPath) =>
+        Result<bool>(Call(BridgeProtocol.Methods.MaterialAssign, A(("target", gameObjectIdOrPath), ("path", materialPath))));
+
+    public PrefabData CreatePrefab(string path, string sourceObjectIdOrPath) =>
+        Result<PrefabData>(Call(BridgeProtocol.Methods.PrefabCreate, A(("path", path), ("source", sourceObjectIdOrPath)))) ?? new();
+
+    public GameObjectData? InstantiatePrefab(string prefabPath, string? parentIdOrPath = null) =>
+        Result<GameObjectData?>(Call(BridgeProtocol.Methods.PrefabInstantiate, A(("path", prefabPath), ("parent", parentIdOrPath))));
+
+    public bool CreateFolder(string path) =>
+        Result<bool>(Call(BridgeProtocol.Methods.FolderCreate, A(("path", path))));
+
+    public bool DeleteAsset(string path) =>
+        Result<bool>(Call(BridgeProtocol.Methods.AssetDelete, A(("path", path))));
+
+    public bool CopyAsset(string fromPath, string toPath) =>
+        Result<bool>(Call(BridgeProtocol.Methods.AssetCopy, A(("fromPath", fromPath), ("toPath", toPath))));
+
+    public bool MoveAsset(string fromPath, string toPath) =>
+        Result<bool>(Call(BridgeProtocol.Methods.AssetMove, A(("fromPath", fromPath), ("toPath", toPath))));
+
+    public void RefreshAssets() => Call(BridgeProtocol.Methods.AssetsRefresh, null);
+
+    public IReadOnlyList<string> ListShaders() =>
+        Result<List<string>>(Call(BridgeProtocol.Methods.ShaderList, null)) ?? new();
+
+    // --- Packages / menu / screenshot / profiler ---
+    public IReadOnlyList<PackageInfo> ListPackages() =>
+        Result<List<PackageInfo>>(Call(BridgeProtocol.Methods.PackageList, null)) ?? new();
+
+    public PackageInfo AddPackage(string packageIdOrUrl) =>
+        Result<PackageInfo>(Call(BridgeProtocol.Methods.PackageAdd, A(("package", packageIdOrUrl)))) ?? new();
+
+    public bool RemovePackage(string packageName) =>
+        Result<bool>(Call(BridgeProtocol.Methods.PackageRemove, A(("package", packageName))));
+
+    public IReadOnlyList<PackageInfo> SearchPackages(string query) =>
+        Result<List<PackageInfo>>(Call(BridgeProtocol.Methods.PackageSearch, A(("query", query)))) ?? new();
+
+    public IReadOnlyList<MenuItemInfo> ListMenuItems(string? filter = null) =>
+        Result<List<MenuItemInfo>>(Call(BridgeProtocol.Methods.MenuList, A(("filter", filter)))) ?? new();
+
+    public bool ExecuteMenuItem(string menuPath) =>
+        Result<bool>(Call(BridgeProtocol.Methods.MenuExecute, A(("path", menuPath))));
+
+    public ScreenshotResult CaptureScreenshot(string source, string? targetId = null, int width = 1280, int height = 720) =>
+        Result<ScreenshotResult>(Call(BridgeProtocol.Methods.Screenshot, A(("source", source), ("targetId", targetId), ("width", width), ("height", height))))
+        ?? new ScreenshotResult { Source = source, PayloadMarker = "empty" };
+
+    public ProfilerSnapshot GetProfilerSnapshot() =>
+        Result<ProfilerSnapshot>(Call(BridgeProtocol.Methods.ProfilerGet, null)) ?? new();
+
+    public void SetProfilerEnabled(bool enabled) =>
+        Call(BridgeProtocol.Methods.ProfilerSetEnabled, A(("enabled", enabled)));
+
+    public void ClearProfilerData() => Call(BridgeProtocol.Methods.ProfilerClear, null);
+
+    public void SaveProfilerData(string path) =>
+        Call(BridgeProtocol.Methods.ProfilerSave, A(("path", path)));
+
+    public ProfilerSnapshot? LoadProfilerData(string path) =>
+        Result<ProfilerSnapshot?>(Call(BridgeProtocol.Methods.ProfilerLoad, A(("path", path))));
+}

@@ -1,0 +1,14 @@
+Unity-Comdr
+Copyright 2026 Unity-Comdr contributors
+
+This product includes design patterns and ideas inspired by open-source
+Unity MCP projects. No full upstream monorepo is vendored; implementations
+are original assemblies that follow similar Editor automation shapes.
+
+Upstream references (not distributed as source copies in this repository):
+
+- CoplayDev/unity-mcp (MIT) — https://github.com/CoplayDev/unity-mcp
+- IvanMurzak/Unity-MCP (Apache-2.0) — https://github.com/IvanMurzak/Unity-MCP
+- CoderGamester/mcp-unity (MIT) — https://github.com/CoderGamester/mcp-unity
+
+See THIRD_PARTY.md for details.

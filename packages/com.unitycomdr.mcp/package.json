@@ -1,0 +1,21 @@
+{
+  "name": "com.unitycomdr.mcp",
+  "version": "0.3.0",
+  "displayName": "Unity-Comdr MCP",
+  "description": "Local-first Unity Editor MCP bridge for AI agents. Token-frugal core tools + on-demand skills. No Python/Node/cloud required.",
+  "unity": "2021.3",
+  "documentationUrl": "https://github.com/unity-comdr/unity-comdr",
+  "licensesUrl": "https://github.com/unity-comdr/unity-comdr/blob/main/LICENSE",
+  "keywords": [
+    "mcp",
+    "ai",
+    "editor",
+    "automation",
+    "comdr"
+  ],
+  "author": {
+    "name": "Unity-Comdr",
+    "url": "https://github.com/unity-comdr/unity-comdr"
+  },
+  "license": "MIT"
+}
