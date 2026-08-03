@@ -20,4 +20,8 @@ Phase E agent UX borrows the Coplay RunTests/GetTestJob async job+poll
 pattern (mode start returns job id; poll for results) into SampleSkills
 tests_run / tests_status (see THIRD_PARTY.md).
 
+Phase R live-bridge main-thread dispatch ports the Coplay
+TransportCommandDispatcher queue+update-pump pattern and CoderGamester
+update-drained bridge idea into LiveUnityBridgeServer (see THIRD_PARTY.md).
+
 See THIRD_PARTY.md for details.

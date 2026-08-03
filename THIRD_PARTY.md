@@ -31,6 +31,14 @@ Unity-Comdr is implemented primarily as **original C# code**. It does **not** cu
 | Cursor / VS Code documented `mcp/install` deeplink shapes | `ClientConfigBuilder.BuildCursorDeeplink` / `BuildVsCodeDeeplink` | Pattern port (BASE64JSON / URL-encoded JSON) |
 | CoderGamester project-relative auto-config idea | `ProjectConfigWriter` + relative host paths in `.cursor/mcp.json` etc. | Pattern port |
 
+## Borrowed algorithms / patterns (Phase R resilience — main thread)
+
+| Upstream source | Our file | Copy method |
+|-----------------|----------|-------------|
+| Coplay `MCPForUnity/Editor/Services/Transport/TransportCommandDispatcher.cs` — permanent `EditorApplication.update` drain, `SynchronizationContext.Post`, `QueuePlayerLoopUpdate` wake, re-entrancy flag | `packages/com.unitycomdr.mcp/Editor/LiveUnityBridgeServer.cs` (`MainThreadQueue`, `ProcessMainThreadQueue`, `RequestMainThreadPump`, `RunOnMainThread`) | Pattern port (MIT; queue + main-thread pump, not a full command registry) |
+| CoderGamester `Editor/UnityBridge` — update-drained queue so requests continue while Editor unfocused | same | Pattern port (idea; no Node/WebSocket transport) |
+| Coplay `StdioBridgeHost` ensure-started on Editor idle after transitions | same (`OnEditorUpdate` auto-`Start` when listener down) | Pattern port (idle re-bind only) |
+
 ## NuGet
 
 - `System.Text.Json` — MIT (Microsoft)

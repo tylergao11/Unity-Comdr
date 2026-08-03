@@ -125,13 +125,15 @@ public static class CoreTools
 
         registry.RegisterCore(Make(
             "editor_state",
-            "Get Editor lifecycle + compile/play/scene state. phase is connected|editor_compiling|editor_reloading|play_transition|editor_gone. compileEpoch marks console log generations; sessionGeneration invalidates prior GameObject instance ids after domain reload. When busy, wait suggestedRetrySeconds and retry — never treat hang/timeout as success.",
+            "Get Editor lifecycle + compile/play/scene state. hostMode is live|headless (never treat headless as live Unity control). phase is connected|editor_compiling|editor_reloading|play_transition|editor_gone. compileEpoch marks console log generations; sessionGeneration invalidates prior GameObject instance ids after domain reload. When busy, wait suggestedRetrySeconds and retry — never treat hang/timeout as success.",
             JsonSchemaHelper.Object(),
             async (_, _) =>
             {
                 var s = editor.GetState();
                 return await Task.FromResult(ToolResult.OkJson(new
                 {
+                    hostMode = s.HostMode,
+                    hostDetail = s.HostDetail,
                     phase = s.Phase,
                     suggestedRetrySeconds = s.SuggestedRetrySeconds,
                     isCompiling = s.IsCompiling,

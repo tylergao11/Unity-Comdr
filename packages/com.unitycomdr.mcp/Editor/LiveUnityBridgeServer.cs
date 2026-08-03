@@ -1,5 +1,6 @@
 #if UNITY_EDITOR
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -19,6 +20,14 @@ namespace UnityComdr.UnityEditor
     /// Live Editor TCP bridge. MCP host (BridgeClientEditorHost) connects here so the same
     /// tool handlers drive real Unity Editor state when the Editor is open.
     /// Protocol: one JSON request/response line per message (see BridgeProtocol in Core).
+    /// <para>
+    /// Main-thread dispatch (borrow-plan R stage): pattern port of
+    /// CoplayDev/unity-mcp <c>TransportCommandDispatcher</c>
+    /// (queue + permanent <c>EditorApplication.update</c> drain +
+    /// <c>SynchronizationContext.Post</c> / <c>QueuePlayerLoopUpdate</c> wake)
+    /// and CoderGamester/mcp-unity <c>Editor/UnityBridge</c> update-drained queue
+    /// (requests continue while Editor is unfocused). See THIRD_PARTY.md.
+    /// </para>
     /// </summary>
     [InitializeOnLoad]
     public static class LiveUnityBridgeServer
@@ -46,6 +55,16 @@ namespace UnityComdr.UnityEditor
         private static volatile bool _isCompiling;
         private static volatile bool _isReloading;
         private static volatile bool _playTransition;
+        // Cached on main thread so TCP-thread doctor probes (ping) never touch SessionState off-main.
+        private static volatile int _sessionGenerationCache = 1;
+        private static volatile int _compileEpochCache;
+        // Coplay TransportCommandDispatcher-style main-thread queue (update-drained).
+        private static readonly ConcurrentQueue<Action> MainThreadQueue = new ConcurrentQueue<Action>();
+        private static SynchronizationContext _mainThreadContext;
+        private static int _mainThreadId;
+        private static int _processingFlag;
+        // Coplay StdioBridgeHost-style ensure-started while Editor is idle after reload.
+        private static double _nextAutoStartAttempt;
         // O1/O2: persist across domain reload via SessionState (statics reset on reload).
         private const string SessionGenerationKey = "UnityComdr.SessionGeneration";
         private const string CompileEpochKey = "UnityComdr.CompileEpoch";
@@ -69,18 +88,115 @@ namespace UnityComdr.UnityEditor
 
         static LiveUnityBridgeServer()
         {
+            // InitializeOnLoad runs on the Unity main thread — capture context like Coplay.
+            _mainThreadContext = SynchronizationContext.Current;
+            _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+
             Application.logMessageReceivedThreaded += OnLog;
             EditorApplication.delayCall += StartIfEnabled;
-            EditorApplication.update += RefreshBusyFlags;
+            // Permanent update hook (Coplay keeps update installed so background commands always process).
+            EditorApplication.update += OnEditorUpdate;
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             EditorApplication.quitting += OnEditorQuitting;
         }
 
-        private static void RefreshBusyFlags()
+        /// <summary>
+        /// Main-thread frame tick: refresh lifecycle caches, drain command queue, keep listener up.
+        /// Mirrors Coplay <c>TransportCommandDispatcher.ProcessQueue</c> + idle ensure-start.
+        /// </summary>
+        private static void OnEditorUpdate()
         {
             _isCompiling = EditorApplication.isCompiling;
+            _sessionGenerationCache = SessionState.GetInt(SessionGenerationKey, 1);
+            _compileEpochCache = SessionState.GetInt(CompileEpochKey, 0);
+            ProcessMainThreadQueue();
+
+            if (!IsRunning && !_isReloading && !EditorApplication.isCompiling &&
+                EditorApplication.timeSinceStartup >= _nextAutoStartAttempt)
+            {
+                _nextAutoStartAttempt = EditorApplication.timeSinceStartup + 2.0;
+                Start(DefaultPort);
+            }
+        }
+
+        /// <summary>
+        /// Drain queued main-thread work. Coplay uses a re-entrancy flag so nested update is safe.
+        /// </summary>
+        private static void ProcessMainThreadQueue()
+        {
+            if (Interlocked.Exchange(ref _processingFlag, 1) == 1)
+                return;
+            try
+            {
+                while (MainThreadQueue.TryDequeue(out var work))
+                {
+                    try { work(); }
+                    catch (Exception ex) { Debug.LogException(ex); }
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _processingFlag, 0);
+            }
+        }
+
+        /// <summary>
+        /// Wake Unity's player/editor loop so queued work runs even when unfocused
+        /// (Coplay <c>RequestMainThreadPump</c> + <c>QueuePlayerLoopUpdate</c>).
+        /// </summary>
+        private static void RequestMainThreadPump()
+        {
+            void Pump()
+            {
+                try { EditorApplication.QueuePlayerLoopUpdate(); }
+                catch { /* best-effort */ }
+                ProcessMainThreadQueue();
+            }
+
+            if (_mainThreadContext != null &&
+                Thread.CurrentThread.ManagedThreadId != _mainThreadId)
+            {
+                _mainThreadContext.Post(_ => Pump(), null);
+                return;
+            }
+
+            Pump();
+        }
+
+        /// <summary>
+        /// Run <paramref name="work"/> on the Unity main thread and wait (TCP worker path).
+        /// Pattern: Coplay <c>RunOnMainThreadAsync</c> / Coder update-drained queue.
+        /// </summary>
+        private static void RunOnMainThread(Action work, int timeoutMs, out bool timedOut)
+        {
+            timedOut = false;
+            if (work == null) return;
+
+            if (Thread.CurrentThread.ManagedThreadId == _mainThreadId ||
+                (_mainThreadId == 0 && Thread.CurrentThread.ManagedThreadId == 1))
+            {
+                work();
+                return;
+            }
+
+            var done = new ManualResetEventSlim(false);
+            Exception captured = null;
+            MainThreadQueue.Enqueue(() =>
+            {
+                try { work(); }
+                catch (Exception ex) { captured = ex; }
+                finally { done.Set(); }
+            });
+            RequestMainThreadPump();
+            if (!done.Wait(timeoutMs))
+            {
+                timedOut = true;
+                return;
+            }
+            if (captured != null)
+                throw captured;
         }
 
         private static void OnPlayModeStateChanged(PlayModeStateChange change)
@@ -108,20 +224,28 @@ namespace UnityComdr.UnityEditor
         private static void OnAfterAssemblyReload()
         {
             // O2: bump sessionGeneration so clients know prior instance ids are invalid.
-            SessionState.SetInt(SessionGenerationKey, GetSessionGeneration() + 1);
+            var next = SessionState.GetInt(SessionGenerationKey, 1) + 1;
+            SessionState.SetInt(SessionGenerationKey, next);
+            _sessionGenerationCache = next;
+            _compileEpochCache = SessionState.GetInt(CompileEpochKey, 0);
             _isReloading = false;
             _playTransition = false;
             _isCompiling = EditorApplication.isCompiling;
+            // beforeAssemblyReload Stop()'d the listener — bring it back without waiting for delayCall.
+            EditorApplication.delayCall += StartIfEnabled;
         }
 
         private static int GetSessionGeneration() =>
-            SessionState.GetInt(SessionGenerationKey, 1);
+            _sessionGenerationCache > 0 ? _sessionGenerationCache : 1;
 
-        private static int GetCompileEpoch() =>
-            SessionState.GetInt(CompileEpochKey, 0);
+        private static int GetCompileEpoch() => _compileEpochCache;
 
-        private static void BumpCompileEpoch() =>
-            SessionState.SetInt(CompileEpochKey, GetCompileEpoch() + 1);
+        private static void BumpCompileEpoch()
+        {
+            var next = GetCompileEpoch() + 1;
+            SessionState.SetInt(CompileEpochKey, next);
+            _compileEpochCache = next;
+        }
 
         private static void OnEditorQuitting()
         {
@@ -248,25 +372,34 @@ namespace UnityComdr.UnityEditor
                         continue;
                     }
 
-                    string responseJson = null;
-                    var done = new ManualResetEventSlim(false);
-                    // Unity API must run on main thread (CoderGamester-style pump: drain on main via delayCall).
-                    EditorApplication.delayCall += () =>
+                    // Doctor probe: answer from TCP thread using volatile caches (no Unity API).
+                    // Host TryConnect(400ms TCP) then ping must not wait on a stalled main thread.
+                    var methodEarly = ExtractString(line, "method");
+                    if (string.Equals(methodEarly, "ping", StringComparison.OrdinalIgnoreCase))
                     {
-                        try
+                        try { writer.WriteLine(Dispatch(line)); }
+                        catch (Exception ex) { try { writer.WriteLine(Fail(null, ex.Message)); } catch { break; } }
+                        continue;
+                    }
+
+                    // Editor API path: Coplay/Coder main-thread queue (not delayCall-from-worker).
+                    string responseJson = null;
+                    bool timedOut;
+                    try
+                    {
+                        RunOnMainThread(() =>
                         {
-                            responseJson = Dispatch(line);
-                        }
-                        catch (Exception ex)
-                        {
-                            responseJson = Fail(null, ex.Message);
-                        }
-                        finally
-                        {
-                            done.Set();
-                        }
-                    };
-                    if (!done.Wait(20000))
+                            try { responseJson = Dispatch(line); }
+                            catch (Exception ex) { responseJson = Fail(null, ex.Message); }
+                        }, 20000, out timedOut);
+                    }
+                    catch (Exception ex)
+                    {
+                        responseJson = Fail(null, ex.Message);
+                        timedOut = false;
+                    }
+
+                    if (timedOut)
                         responseJson = Fail(null, FormatBusyError("editor_reloading", 5,
                             "Editor main thread timeout (likely reload/compile). Wait and retry."));
                     try { writer.WriteLine(responseJson ?? Fail(null, "empty response")); }
@@ -415,7 +548,15 @@ namespace UnityComdr.UnityEditor
                         return Ok(id, SerializeLogs());
                     case "console.clear":
                         lock (Gate) Logs.Clear();
-                        try { typeof(UnityEditor.LogEntries).GetMethod("Clear")?.Invoke(null, null); } catch { /* optional */ }
+                        // global:: required: we are inside namespace UnityComdr.UnityEditor, so
+                        // "UnityEditor.LogEntries" would bind to this namespace, not the Unity API.
+                        // LogEntries is internal — resolve by name to avoid CS0122.
+                        try
+                        {
+                            var logEntries = typeof(EditorApplication).Assembly.GetType("UnityEditor.LogEntries");
+                            logEntries?.GetMethod("Clear")?.Invoke(null, null);
+                        }
+                        catch { /* optional */ }
                         return Ok(id, "null");
                     case "console.add":
                     {
@@ -1993,6 +2134,8 @@ namespace UnityComdr.UnityEditor
             var phase = CurrentPhase();
             var retry = SuggestedRetryForPhase(phase);
             return "{"
+                + "\"hostMode\":\"live\","
+                + "\"hostDetail\":" + JsonString("LiveUnityBridgeServer on 127.0.0.1:" + ListeningPort) + ","
                 + "\"phase\":" + JsonString(phase) + ","
                 + (retry.HasValue ? "\"suggestedRetrySeconds\":" + retry.Value + "," : "")
                 + "\"isCompiling\":" + (_isCompiling ? "true" : "false") + ","
@@ -2170,3 +2313,5 @@ namespace UnityComdr.UnityEditor
     }
 }
 #endif
+
+

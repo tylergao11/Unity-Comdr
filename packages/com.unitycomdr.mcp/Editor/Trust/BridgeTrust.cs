@@ -28,6 +28,24 @@ namespace UnityComdr.UnityEditor
 
         public static void RevokeConsent() => EditorPrefs.DeleteKey(ConsentPrefsKey);
 
+        /// <summary>
+        /// Menu + <c>-executeMethod</c> entry so operators/CI can pre-approve without the modal.
+        /// Same EditorPrefs key as Window → Unity-Comdr MCP → Approve now.
+        /// </summary>
+        [MenuItem("Window/Unity-Comdr MCP/Approve Bridge Consent")]
+        public static void ApproveConsentMenu()
+        {
+            SetConsentApproved(true);
+            Debug.Log("[Unity-Comdr] Bridge consent approved (EditorPrefs).");
+        }
+
+        /// <summary>Parameterless hook for Unity <c>-executeMethod UnityComdr.UnityEditor.BridgeTrust.ApproveConsentForAutomation</c>.</summary>
+        public static void ApproveConsentForAutomation()
+        {
+            SetConsentApproved(true);
+            Debug.Log("[Unity-Comdr] Bridge consent approved via executeMethod.");
+        }
+
         public static bool IsDoctorMethod(string method)
         {
             if (string.IsNullOrEmpty(method)) return false;

@@ -17,6 +17,8 @@ public sealed class McpServer
     private readonly TextReader _input;
     private readonly TextWriter _output;
     private readonly TextWriter? _log;
+    private readonly string _hostMode;
+    private readonly string _hostDetail;
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -25,12 +27,22 @@ public sealed class McpServer
         WriteIndented = false
     };
 
-    public McpServer(ComdrRuntime runtime, TextReader input, TextWriter output, TextWriter? log = null)
+    /// <param name="hostMode">Agent-visible adapter: <c>live</c> or <c>headless</c>.</param>
+    /// <param name="hostDetail">Factory selection detail (why live/headless was chosen).</param>
+    public McpServer(
+        ComdrRuntime runtime,
+        TextReader input,
+        TextWriter output,
+        TextWriter? log = null,
+        string hostMode = "headless",
+        string? hostDetail = null)
     {
         _runtime = runtime;
         _input = input;
         _output = output;
         _log = log;
+        _hostMode = string.IsNullOrWhiteSpace(hostMode) ? "headless" : hostMode;
+        _hostDetail = hostDetail ?? "";
     }
 
     public async Task RunAsync(CancellationToken ct = default)
@@ -135,27 +147,41 @@ public sealed class McpServer
         return response;
     }
 
-    private JsonObject InitializeResult() => new()
+    private JsonObject InitializeResult()
     {
-        ["protocolVersion"] = "2024-11-05",
-        ["capabilities"] = new JsonObject
+        var live = string.Equals(_hostMode, "live", StringComparison.OrdinalIgnoreCase);
+        var modeLine = live
+            ? "hostMode=live — tools control a real Unity Editor via the TCP bridge. "
+            : "hostMode=headless — InMemoryEditorHost only; NOT live Unity control. " +
+              "Open Unity with com.unitycomdr.mcp so the bridge listens, then restart this host. ";
+        if (!string.IsNullOrWhiteSpace(_hostDetail))
+            modeLine += "detail=" + _hostDetail + " ";
+
+        return new()
         {
-            ["tools"] = new JsonObject { ["listChanged"] = true },
-            ["resources"] = new JsonObject { ["listChanged"] = false },
-            ["prompts"] = new JsonObject { ["listChanged"] = false }
-        },
-        ["serverInfo"] = new JsonObject
-        {
-            ["name"] = "unity-comdr",
-            ["version"] = "0.2.0"
-        },
-        ["instructions"] =
-            "Unity-Comdr: local-first Unity Editor MCP (no Python/Node/cloud). " +
-            "Default ≤15 core tools for console/scripts/scene/GO/assets. " +
-            "Use skill_manage action=list|load to unlock playmode, packages, menu, profiling, screenshots, batch, testing. " +
-            "Use resources/list (unity://hierarchy, unity://console, …) and prompts/list for guided workflows. " +
-            "Escape hatches (reflect_call/execute_code) off until escape_hatches_set enabled=true."
-    };
+            ["protocolVersion"] = "2024-11-05",
+            ["capabilities"] = new JsonObject
+            {
+                ["tools"] = new JsonObject { ["listChanged"] = true },
+                ["resources"] = new JsonObject { ["listChanged"] = false },
+                ["prompts"] = new JsonObject { ["listChanged"] = false }
+            },
+            ["serverInfo"] = new JsonObject
+            {
+                ["name"] = "unity-comdr",
+                ["version"] = "0.2.0",
+                ["hostMode"] = _hostMode
+            },
+            ["instructions"] =
+                "Unity-Comdr: local-first Unity Editor MCP (no Python/Node/cloud). " +
+                modeLine +
+                "Poll editor_state.hostMode (live|headless) before treating mutations as Editor changes. " +
+                "Default ≤15 core tools for console/scripts/scene/GO/assets. " +
+                "Use skill_manage action=list|load to unlock playmode, packages, menu, profiling, screenshots, batch, testing. " +
+                "Use resources/list (unity://hierarchy, unity://console, …) and prompts/list for guided workflows. " +
+                "Escape hatches (reflect_call/execute_code) off until escape_hatches_set enabled=true."
+        };
+    }
 
     private JsonObject ToolsListResult()
     {

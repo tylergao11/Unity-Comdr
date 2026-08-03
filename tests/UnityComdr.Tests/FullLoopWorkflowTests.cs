@@ -235,29 +235,85 @@ public class FullLoopWorkflowTests
         Assert.Contains("LiveUnityBridgeServer", src);
         Assert.Contains("InitializeOnLoad", src);
         Assert.Contains("TcpListener", src);
+        // borrow-plan R: Coplay TransportCommandDispatcher + Coder update-drained queue
+        Assert.Contains("TransportCommandDispatcher", src);
+        Assert.Contains("MainThreadQueue", src);
+        Assert.Contains("ProcessMainThreadQueue", src);
+        Assert.Contains("RequestMainThreadPump", src);
+        Assert.Contains("QueuePlayerLoopUpdate", src);
+        Assert.Contains("EditorApplication.update", src);
         var clientPath = Path.Combine(repoRoot, "src", "UnityComdr.Core", "Editor", "BridgeClientEditorHost.cs");
         Assert.True(File.Exists(clientPath), $"Missing bridge client: {clientPath}");
         Assert.Contains("BridgeClientEditorHost", File.ReadAllText(clientPath));
         Assert.Contains("IEditorHost", File.ReadAllText(clientPath));
 
-        // Factory falls back to headless when no Unity bridge is listening
+        // Factory falls back to headless when forced (independent of local Unity).
         Environment.SetEnvironmentVariable(EditorHostFactory.EnvForceHeadless, "1");
         try
         {
             var sel = EditorHostFactory.CreateFromEnvironment();
             Assert.Equal(EditorHostMode.HeadlessInMemory, sel.Mode);
             Assert.IsType<InMemoryEditorHost>(sel.Host);
+            Assert.Equal("headless", sel.Host.GetState().HostMode);
         }
         finally
         {
             Environment.SetEnvironmentVariable(EditorHostFactory.EnvForceHeadless, null);
         }
 
-        // Without force flag, no bridge → still headless (honest fallback)
+        // Without force flag: pin a free port so "no bridge" is deterministic even if
+        // a live Editor is listening on the default 17890 (criterion 1 environment).
         Environment.SetEnvironmentVariable(EditorHostFactory.EnvForceHeadless, null);
-        var auto = EditorHostFactory.CreateFromEnvironment();
-        Assert.Equal(EditorHostMode.HeadlessInMemory, auto.Mode);
-        Assert.Contains("InMemory", auto.Detail, StringComparison.OrdinalIgnoreCase);
+        Environment.SetEnvironmentVariable(EditorHostFactory.EnvPort, "17991");
+        try
+        {
+            var auto = EditorHostFactory.CreateFromEnvironment();
+            Assert.Equal(EditorHostMode.HeadlessInMemory, auto.Mode);
+            Assert.Contains("InMemory", auto.Detail, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("headless", auto.Host.GetState().HostMode);
+            // Dispose live client if factory somehow connected (should not).
+            if (auto.Host is IDisposable d) d.Dispose();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(EditorHostFactory.EnvPort, null);
+        }
+    }
+
+    [Fact]
+    public async Task Editor_state_and_initialize_surface_hostMode_headless_when_no_bridge()
+    {
+        var rt = new ComdrRuntime(new InMemoryEditorHost());
+        var state = await rt.Registry.CallAsync("editor_state", null);
+        Assert.False(state.IsError);
+        Assert.Contains("\"hostMode\":\"headless\"", state.Content.Replace(" ", ""));
+
+        var server = new McpHost.McpServer(
+            rt, new StringReader(""), new StringWriter(),
+            hostMode: "headless",
+            hostDetail: "test no bridge");
+        var init = await server.HandleLineAsync(
+            """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}""");
+        Assert.NotNull(init);
+        Assert.Equal("headless", init!["result"]?["serverInfo"]?["hostMode"]?.GetValue<string>());
+        var instructions = init["result"]?["instructions"]?.GetValue<string>() ?? "";
+        Assert.Contains("hostMode=headless", instructions);
+        Assert.Contains("NOT live Unity", instructions);
+    }
+
+    [Fact]
+    public async Task Initialize_live_mode_instructions_are_agent_visible()
+    {
+        var server = new McpHost.McpServer(
+            new ComdrRuntime(), new StringReader(""), new StringWriter(),
+            hostMode: "live",
+            hostDetail: "Connected to Unity live bridge on 127.0.0.1:17890.");
+        var init = await server.HandleLineAsync(
+            """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}""");
+        Assert.Equal("live", init!["result"]?["serverInfo"]?["hostMode"]?.GetValue<string>());
+        var instructions = init["result"]?["instructions"]?.GetValue<string>() ?? "";
+        Assert.Contains("hostMode=live", instructions);
+        Assert.DoesNotContain("NOT live Unity", instructions);
     }
 
     private static JsonObject Obj(params (string k, object v)[] pairs)

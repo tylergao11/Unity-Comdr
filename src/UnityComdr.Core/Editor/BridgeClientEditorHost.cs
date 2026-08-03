@@ -223,6 +223,8 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
                 state.SuggestedRetrySeconds = EditorLifecyclePhases.DefaultRetrySeconds(state.Phase);
             if (state.SessionGeneration == 0 && _hasSessionGeneration)
                 state.SessionGeneration = _sessionGeneration;
+            state.HostMode = "live";
+            state.HostDetail ??= $"BridgeClientEditorHost on 127.0.0.1:{_port}";
             return state;
         }
         catch (EditorBusyException busy)
@@ -233,7 +235,9 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
                 SuggestedRetrySeconds = busy.SuggestedRetrySeconds,
                 IsCompiling = string.Equals(busy.Phase, EditorLifecyclePhases.EditorCompiling, StringComparison.OrdinalIgnoreCase),
                 ActiveScenePath = "",
-                SessionGeneration = _sessionGeneration
+                SessionGeneration = _sessionGeneration,
+                HostMode = "live",
+                HostDetail = $"BridgeClientEditorHost busy on 127.0.0.1:{_port}: {busy.Phase}"
             };
         }
     }

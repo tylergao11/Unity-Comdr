@@ -18,10 +18,12 @@ var runtime = new ComdrRuntime(selection.Host);
 using var input = new StreamReader(Console.OpenStandardInput(), leaveOpen: true);
 using var output = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
 
+// Agent-visible mode token: live | headless (never present headless as live Editor control).
+var hostMode = selection.Mode == EditorHostMode.LiveUnityBridge ? "live" : "headless";
 Console.Error.WriteLine(
-    $"unity-comdr mcp host starting mode={selection.Mode} coreTools={runtime.Registry.CoreToolCount} detail={selection.Detail}");
+    $"unity-comdr mcp host starting hostMode={hostMode} mode={selection.Mode} coreTools={runtime.Registry.CoreToolCount} detail={selection.Detail}");
 
-var server = new McpServer(runtime, input, output, Console.Error);
+var server = new McpServer(runtime, input, output, Console.Error, hostMode, selection.Detail);
 await server.RunAsync();
 
 if (selection.Host is IDisposable d)

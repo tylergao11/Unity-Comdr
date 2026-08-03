@@ -196,7 +196,9 @@ public sealed class InMemoryEditorHost : IEditorHost
             Phase = phase,
             SuggestedRetrySeconds = EditorLifecyclePhases.IsBusy(phase) ? _forcedRetrySeconds : null,
             CompileEpoch = _compileEpoch,
-            SessionGeneration = _sessionGeneration
+            SessionGeneration = _sessionGeneration,
+            HostMode = "headless",
+            HostDetail = "InMemoryEditorHost — not connected to a live Unity Editor bridge."
         };
     }
 

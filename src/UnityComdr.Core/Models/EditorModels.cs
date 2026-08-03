@@ -91,6 +91,15 @@ public sealed class EditorState
 
     /// <summary>Monotonic domain-reload generation; invalidates prior instance ids (O2 / FR-A5).</summary>
     public int SessionGeneration { get; set; } = 1;
+
+    /// <summary>
+    /// Host adapter: <c>live</c> = Unity TCP bridge, <c>headless</c> = InMemoryEditorHost.
+    /// Agent-visible so silent headless is never mistaken for live Editor control.
+    /// </summary>
+    public string HostMode { get; set; } = "headless";
+
+    /// <summary>Optional human-readable host selection detail from <c>EditorHostFactory</c>.</summary>
+    public string? HostDetail { get; set; }
 }
 
 public sealed class MaterialData
