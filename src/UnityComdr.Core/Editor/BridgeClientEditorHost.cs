@@ -16,11 +16,16 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
     private StreamReader? _reader;
     private StreamWriter? _writer;
     private readonly object _gate = new();
+    private int _sessionGeneration;
+    private bool _hasSessionGeneration;
 
     public BridgeClientEditorHost(int port = EditorHostFactory.DefaultLiveBridgePort)
     {
         _port = port;
     }
+
+    /// <summary>Last sessionGeneration observed from ping/getState (O2).</summary>
+    public int SessionGeneration => _sessionGeneration;
 
     public bool TryConnect(TimeSpan timeout)
     {
@@ -40,7 +45,7 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
             _client = client;
             _reader = new StreamReader(stream, Encoding.UTF8, false, 4096, leaveOpen: true);
             _writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
-            var pong = Call(BridgeProtocol.Methods.Ping, null);
+            var pong = Call(BridgeProtocol.Methods.Ping, null, trackGeneration: true, allowGenerationChange: true);
             return pong.Ok;
         }
         catch
@@ -60,30 +65,120 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
         _client = null;
     }
 
-    private BridgeProtocol.Response Call(string method, Dictionary<string, object?>? args)
+    private BridgeProtocol.Response Call(
+        string method,
+        Dictionary<string, object?>? args,
+        bool trackGeneration = true,
+        bool allowGenerationChange = false)
     {
         lock (_gate)
         {
             if (_writer == null || _reader == null)
-                throw new InvalidOperationException("Live bridge not connected.");
+                throw new EditorBusyException(
+                    EditorLifecyclePhases.EditorGone,
+                    nextStep: "Live bridge not connected. Open Unity with Unity-Comdr package so the bridge listens, then retry.");
 
-            var req = new BridgeProtocol.Request
+            try
             {
-                Method = method,
-                Args = args?.ToDictionary(
-                    kv => kv.Key,
-                    kv => JsonSerializer.SerializeToElement(kv.Value, BridgeProtocol.JsonOptions))
-            };
-            var line = JsonSerializer.Serialize(req, BridgeProtocol.JsonOptions);
-            _writer.WriteLine(line);
-            var responseLine = _reader.ReadLine()
-                ?? throw new IOException("Live bridge closed the connection.");
-            var resp = JsonSerializer.Deserialize<BridgeProtocol.Response>(responseLine, BridgeProtocol.JsonOptions)
-                ?? throw new InvalidOperationException("Invalid bridge response.");
-            if (!resp.Ok)
-                throw new InvalidOperationException(resp.Error ?? "Bridge error");
-            return resp;
+                var req = new BridgeProtocol.Request
+                {
+                    Method = method,
+                    Args = args?.ToDictionary(
+                        kv => kv.Key,
+                        kv => JsonSerializer.SerializeToElement(kv.Value, BridgeProtocol.JsonOptions))
+                };
+                var line = JsonSerializer.Serialize(req, BridgeProtocol.JsonOptions);
+                _writer.WriteLine(line);
+                var responseLine = _reader.ReadLine();
+                if (responseLine == null)
+                {
+                    Dispose();
+                    throw new EditorBusyException(
+                        EditorLifecyclePhases.EditorReloading,
+                        nextStep: "Live bridge closed the connection (likely domain reload). Wait, reconnect, then retry.");
+                }
+
+                var resp = JsonSerializer.Deserialize<BridgeProtocol.Response>(responseLine, BridgeProtocol.JsonOptions)
+                    ?? throw new InvalidOperationException("Invalid bridge response.");
+                if (!resp.Ok)
+                {
+                    if (EditorBusyException.TryParse(resp.Error, out var busy) && busy != null)
+                        throw busy;
+                    throw new InvalidOperationException(resp.Error ?? "Bridge error");
+                }
+
+                if (trackGeneration)
+                    NoteSessionGeneration(responseLine, allowGenerationChange);
+
+                return resp;
+            }
+            catch (EditorBusyException)
+            {
+                throw;
+            }
+            catch (InvalidOperationException)
+            {
+                throw;
+            }
+            catch (IOException)
+            {
+                Dispose();
+                throw new EditorBusyException(
+                    EditorLifecyclePhases.EditorReloading,
+                    nextStep: "Bridge I/O failed during Editor transition. Wait suggestedRetrySeconds, reconnect, then retry.");
+            }
+            catch (SocketException)
+            {
+                Dispose();
+                throw new EditorBusyException(
+                    EditorLifecyclePhases.EditorGone,
+                    nextStep: "Bridge socket failed. Ensure Unity Editor live bridge is running, then retry.");
+            }
         }
+    }
+
+    /// <summary>
+    /// Best-effort O2 guard: if the bridge reports a new sessionGeneration mid-session,
+    /// fail explicitly instead of continuing with stale instance ids.
+    /// Lifecycle probes (ping/getState) may adopt the new generation without throwing.
+    /// </summary>
+    private void NoteSessionGeneration(string responseLine, bool allowGenerationChange)
+    {
+        var gen = TryReadIntProperty(responseLine, "sessionGeneration");
+        if (gen is null) return;
+
+        if (_hasSessionGeneration && gen.Value != _sessionGeneration && !allowGenerationChange)
+        {
+            var previous = _sessionGeneration;
+            _sessionGeneration = gen.Value;
+            throw new InvalidOperationException(
+                $"stale_reference: sessionGeneration changed {previous} -> {gen.Value}. " +
+                "Re-find GameObjects by hierarchy path; do not reuse prior instance ids.");
+        }
+
+        _sessionGeneration = gen.Value;
+        _hasSessionGeneration = true;
+    }
+
+    private static int? TryReadIntProperty(string json, string key)
+    {
+        var marker = "\"" + key + "\":";
+        var idx = json.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return null;
+        var start = idx + marker.Length;
+        while (start < json.Length && char.IsWhiteSpace(json[start])) start++;
+        var end = start;
+        while (end < json.Length && (char.IsDigit(json[end]) || json[end] == '-')) end++;
+        if (end > start && int.TryParse(json.AsSpan(start, end - start), out var value))
+            return value;
+        return null;
+    }
+
+    /// <summary>Id-based ops: refuse if sessionGeneration moved since last observed value.</summary>
+    private void EnsureSessionStableForIdOp()
+    {
+        if (!_hasSessionGeneration) return;
+        Call(BridgeProtocol.Methods.Ping, null, trackGeneration: true, allowGenerationChange: false);
     }
 
     private T Result<T>(BridgeProtocol.Response resp)
@@ -110,8 +205,38 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
         Call(BridgeProtocol.Methods.AddConsoleLog, A(("entry", entry)));
 
     // --- Editor ---
-    public EditorState GetState() =>
-        Result<EditorState>(Call(BridgeProtocol.Methods.GetState, null)) ?? new();
+    public EditorState GetState()
+    {
+        try
+        {
+            // Lifecycle probe may adopt a new sessionGeneration after domain reload.
+            var state = Result<EditorState>(
+                Call(BridgeProtocol.Methods.GetState, null, trackGeneration: true, allowGenerationChange: true)) ?? new();
+            if (string.IsNullOrWhiteSpace(state.Phase))
+            {
+                state.Phase = state.IsCompiling
+                    ? EditorLifecyclePhases.EditorCompiling
+                    : EditorLifecyclePhases.Connected;
+            }
+
+            if (EditorLifecyclePhases.IsBusy(state.Phase) && state.SuggestedRetrySeconds is null)
+                state.SuggestedRetrySeconds = EditorLifecyclePhases.DefaultRetrySeconds(state.Phase);
+            if (state.SessionGeneration == 0 && _hasSessionGeneration)
+                state.SessionGeneration = _sessionGeneration;
+            return state;
+        }
+        catch (EditorBusyException busy)
+        {
+            return new EditorState
+            {
+                Phase = busy.Phase,
+                SuggestedRetrySeconds = busy.SuggestedRetrySeconds,
+                IsCompiling = string.Equals(busy.Phase, EditorLifecyclePhases.EditorCompiling, StringComparison.OrdinalIgnoreCase),
+                ActiveScenePath = "",
+                SessionGeneration = _sessionGeneration
+            };
+        }
+    }
 
     public void SetCompiling(bool compiling) { /* Unity owns compile state */ }
 
@@ -167,8 +292,13 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
         Result<bool>(Call(BridgeProtocol.Methods.SceneSetActive, A(("path", path))));
 
     // --- GameObjects ---
-    public GameObjectData? FindGameObject(string idOrPath) =>
-        Result<GameObjectData?>(Call(BridgeProtocol.Methods.GoFind, A(("idOrPath", idOrPath))));
+    public GameObjectData? FindGameObject(string idOrPath)
+    {
+        // Path-based lookup remains valid across reload; bare ids need a generation check.
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<GameObjectData?>(Call(BridgeProtocol.Methods.GoFind, A(("idOrPath", idOrPath))));
+    }
 
     public IReadOnlyList<GameObjectData> FindGameObjects(string? name = null, string? tag = null, string? componentType = null) =>
         Result<List<GameObjectData>>(Call(BridgeProtocol.Methods.GoFindMany, A(("name", name), ("tag", tag), ("componentType", componentType)))) ?? new();
@@ -179,42 +309,90 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
     public GameObjectData CreateGameObject(string name, string? parentIdOrPath = null, string? primitiveType = null) =>
         Result<GameObjectData>(Call(BridgeProtocol.Methods.GoCreate, A(("name", name), ("parent", parentIdOrPath), ("primitive", primitiveType)))) ?? new();
 
-    public bool DeleteGameObject(string idOrPath) =>
-        Result<bool>(Call(BridgeProtocol.Methods.GoDelete, A(("idOrPath", idOrPath))));
+    public bool DeleteGameObject(string idOrPath)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.GoDelete, A(("idOrPath", idOrPath))));
+    }
 
-    public GameObjectData? DuplicateGameObject(string idOrPath, string? newName = null) =>
-        Result<GameObjectData?>(Call(BridgeProtocol.Methods.GoDuplicate, A(("idOrPath", idOrPath), ("newName", newName))));
+    public GameObjectData? DuplicateGameObject(string idOrPath, string? newName = null)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<GameObjectData?>(Call(BridgeProtocol.Methods.GoDuplicate, A(("idOrPath", idOrPath), ("newName", newName))));
+    }
 
-    public bool SetParent(string idOrPath, string? newParentIdOrPath) =>
-        Result<bool>(Call(BridgeProtocol.Methods.GoSetParent, A(("idOrPath", idOrPath), ("parent", newParentIdOrPath))));
+    public bool SetParent(string idOrPath, string? newParentIdOrPath)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.GoSetParent, A(("idOrPath", idOrPath), ("parent", newParentIdOrPath))));
+    }
 
-    public bool SetTransform(string idOrPath, Vector3? position = null, Vector3? rotation = null, Vector3? scale = null) =>
-        Result<bool>(Call(BridgeProtocol.Methods.GoSetTransform, A(("idOrPath", idOrPath), ("position", position), ("rotation", rotation), ("scale", scale))));
+    public bool SetTransform(string idOrPath, Vector3? position = null, Vector3? rotation = null, Vector3? scale = null)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.GoSetTransform, A(("idOrPath", idOrPath), ("position", position), ("rotation", rotation), ("scale", scale))));
+    }
 
-    public bool SetActive(string idOrPath, bool active) =>
-        Result<bool>(Call(BridgeProtocol.Methods.GoSetActive, A(("idOrPath", idOrPath), ("active", active))));
+    public bool SetActive(string idOrPath, bool active)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.GoSetActive, A(("idOrPath", idOrPath), ("active", active))));
+    }
 
-    public bool RenameGameObject(string idOrPath, string newName) =>
-        Result<bool>(Call(BridgeProtocol.Methods.GoRename, A(("idOrPath", idOrPath), ("newName", newName))));
+    public bool RenameGameObject(string idOrPath, string newName)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.GoRename, A(("idOrPath", idOrPath), ("newName", newName))));
+    }
 
-    public bool SetTag(string idOrPath, string tag) =>
-        Result<bool>(Call(BridgeProtocol.Methods.GoSetTag, A(("idOrPath", idOrPath), ("tag", tag))));
+    public bool SetTag(string idOrPath, string tag)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.GoSetTag, A(("idOrPath", idOrPath), ("tag", tag))));
+    }
 
-    public bool SetLayer(string idOrPath, int layer) =>
-        Result<bool>(Call(BridgeProtocol.Methods.GoSetLayer, A(("idOrPath", idOrPath), ("layer", layer))));
+    public bool SetLayer(string idOrPath, int layer)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.GoSetLayer, A(("idOrPath", idOrPath), ("layer", layer))));
+    }
 
     // --- Components ---
-    public bool AddComponent(string idOrPath, string typeName, Dictionary<string, object?>? properties = null) =>
-        Result<bool>(Call(BridgeProtocol.Methods.CompAdd, A(("idOrPath", idOrPath), ("typeName", typeName), ("properties", properties))));
+    public bool AddComponent(string idOrPath, string typeName, Dictionary<string, object?>? properties = null)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.CompAdd, A(("idOrPath", idOrPath), ("typeName", typeName), ("properties", properties))));
+    }
 
-    public bool RemoveComponent(string idOrPath, string typeName) =>
-        Result<bool>(Call(BridgeProtocol.Methods.CompRemove, A(("idOrPath", idOrPath), ("typeName", typeName))));
+    public bool RemoveComponent(string idOrPath, string typeName)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.CompRemove, A(("idOrPath", idOrPath), ("typeName", typeName))));
+    }
 
-    public bool ModifyComponent(string idOrPath, string typeName, Dictionary<string, object?> properties) =>
-        Result<bool>(Call(BridgeProtocol.Methods.CompModify, A(("idOrPath", idOrPath), ("typeName", typeName), ("properties", properties))));
+    public bool ModifyComponent(string idOrPath, string typeName, Dictionary<string, object?> properties)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<bool>(Call(BridgeProtocol.Methods.CompModify, A(("idOrPath", idOrPath), ("typeName", typeName), ("properties", properties))));
+    }
 
-    public ComponentData? GetComponent(string idOrPath, string typeName) =>
-        Result<ComponentData?>(Call(BridgeProtocol.Methods.CompGet, A(("idOrPath", idOrPath), ("typeName", typeName))));
+    public ComponentData? GetComponent(string idOrPath, string typeName)
+    {
+        if (!string.IsNullOrEmpty(idOrPath) && !idOrPath.Contains('/'))
+            EnsureSessionStableForIdOp();
+        return Result<ComponentData?>(Call(BridgeProtocol.Methods.CompGet, A(("idOrPath", idOrPath), ("typeName", typeName))));
+    }
 
     public IReadOnlyList<string> ListComponentTypes(string? filter = null) =>
         Result<List<string>>(Call(BridgeProtocol.Methods.CompListTypes, A(("filter", filter)))) ?? new();
@@ -271,9 +449,36 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
     public bool ExecuteMenuItem(string menuPath) =>
         Result<bool>(Call(BridgeProtocol.Methods.MenuExecute, A(("path", menuPath))));
 
-    public ScreenshotResult CaptureScreenshot(string source, string? targetId = null, int width = 1280, int height = 720) =>
-        Result<ScreenshotResult>(Call(BridgeProtocol.Methods.Screenshot, A(("source", source), ("targetId", targetId), ("width", width), ("height", height))))
-        ?? new ScreenshotResult { Source = source, PayloadMarker = "empty" };
+    public ScreenshotResult CaptureScreenshot(
+        string source,
+        string? targetId = null,
+        int width = 1280,
+        int height = 720,
+        int maxResolution = 640,
+        int? regionX = null,
+        int? regionY = null,
+        int? regionWidth = null,
+        int? regionHeight = null) =>
+        Result<ScreenshotResult>(Call(BridgeProtocol.Methods.Screenshot, A(
+            ("source", source),
+            ("targetId", targetId),
+            ("width", width),
+            ("height", height),
+            ("maxResolution", maxResolution),
+            ("regionX", regionX),
+            ("regionY", regionY),
+            ("regionWidth", regionWidth),
+            ("regionHeight", regionHeight))))
+        ?? new ScreenshotResult
+        {
+            Source = source,
+            TargetId = targetId,
+            Width = width,
+            Height = height,
+            IsRealPixels = false,
+            Format = "none",
+            Note = "Live bridge returned an empty screenshot result."
+        };
 
     public ProfilerSnapshot GetProfilerSnapshot() =>
         Result<ProfilerSnapshot>(Call(BridgeProtocol.Methods.ProfilerGet, null)) ?? new();
@@ -288,4 +493,50 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
 
     public ProfilerSnapshot? LoadProfilerData(string path) =>
         Result<ProfilerSnapshot?>(Call(BridgeProtocol.Methods.ProfilerLoad, A(("path", path))));
+
+    public IReadOnlyList<UiControlInfo> QueryUi(string? filter = null) =>
+        Result<List<UiControlInfo>>(Call(BridgeProtocol.Methods.UiQuery, A(("filter", filter)))) ?? new();
+
+    public InputSimulateResult SimulateInput(
+        string action,
+        string? target = null,
+        float? x = null,
+        float? y = null,
+        float? toX = null,
+        float? toY = null,
+        float? deltaX = null,
+        float? deltaY = null,
+        string? key = null) =>
+        Result<InputSimulateResult>(Call(BridgeProtocol.Methods.InputSimulate, A(
+            ("action", action),
+            ("target", target),
+            ("x", x),
+            ("y", y),
+            ("toX", toX),
+            ("toY", toY),
+            ("deltaX", deltaX),
+            ("deltaY", deltaY),
+            ("key", key))))
+        ?? new InputSimulateResult { Ok = false, Action = action, Note = "empty bridge result" };
+
+    public LeaseInfo GetLease() =>
+        Result<LeaseInfo>(Call(BridgeProtocol.Methods.LeaseGet, null)) ?? new();
+
+    public LeaseInfo AcquireLease(string agentId, double ttlSeconds) =>
+        Result<LeaseInfo>(Call(BridgeProtocol.Methods.LeaseAcquire, A(("agentId", agentId), ("ttlSeconds", ttlSeconds))))
+        ?? new();
+
+    public bool ReleaseLease(string agentId) =>
+        Result<bool>(Call(BridgeProtocol.Methods.LeaseRelease, A(("agentId", agentId))));
+
+    public LeaseAuthorization AuthorizeWrite(string? agentId, bool requireHeld = false)
+    {
+        var lease = GetLease();
+        if (!lease.Held)
+            return requireHeld ? LeaseAuthorization.MissingLease() : LeaseAuthorization.Ok();
+        if (!string.IsNullOrWhiteSpace(agentId) &&
+            string.Equals(lease.Holder, agentId, StringComparison.OrdinalIgnoreCase))
+            return LeaseAuthorization.Ok(lease.Holder, lease.ExpiresAt);
+        return LeaseAuthorization.Busy(lease.Holder, lease.ExpiresAt);
+    }
 }

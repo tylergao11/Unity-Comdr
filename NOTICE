@@ -11,4 +11,13 @@ Upstream references (not distributed as source copies in this repository):
 - IvanMurzak/Unity-MCP (Apache-2.0) — https://github.com/IvanMurzak/Unity-MCP
 - CoderGamester/mcp-unity (MIT) — https://github.com/CoderGamester/mcp-unity
 
+Phase V vision capture ports algorithms from Coplay ScreenshotUtility /
+EditorWindowScreenshotUtility / manage_camera ImageContent patterns into
+Unity-Comdr's own C# (see THIRD_PARTY.md borrow table). Upstream MIT license
+terms continue to apply to those borrowed ideas.
+
+Phase E agent UX borrows the Coplay RunTests/GetTestJob async job+poll
+pattern (mode start returns job id; poll for results) into SampleSkills
+tests_run / tests_status (see THIRD_PARTY.md).
+
 See THIRD_PARTY.md for details.

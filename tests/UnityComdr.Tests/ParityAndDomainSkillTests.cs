@@ -62,8 +62,9 @@ public class ParityAndDomainSkillTests
 
         await Load(rt, DomainSkills.ScreenshotsId);
         var shot = await rt.Registry.CallAsync("screenshot_capture", Obj(("source", "game_view")));
-        Assert.False(shot.IsError);
-        Assert.Contains("screenshot:", shot.Content);
+        Assert.True(shot.IsError);
+        Assert.DoesNotContain("payloadMarker", shot.Content);
+        Assert.Contains("real pixels", shot.Content, StringComparison.OrdinalIgnoreCase);
 
         await Load(rt, DomainSkills.BatchId);
         var batch = await rt.Registry.CallAsync("batch_execute", Obj(

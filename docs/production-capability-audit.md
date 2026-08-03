@@ -1,11 +1,11 @@
 # Unity-Comdr Production Capability Audit
 
-**Date:** 2026-08-02  
-**Product version:** 0.2.x (Editor MCP surface)  
-**Scope of “全部能力”:** Full **Editor** MCP catalog (core + domain skills + resources/prompts + live bridge properties).  
+**Date:** 2026-08-03  
+**Product version:** 0.4.0 (Editor MCP surface)  
+**Scope of “全部能力”:** Full **Editor** MCP catalog (core + domain skills + resources/prompts + live bridge properties + install/trust).  
 **Out of this product surface (explicit, not silent residual):** In-game Runtime MCP, multi-instance fleet routing, remote cloud relay, OpenUPM publish, 70–200 always-on tools.
 
-Legend: **PASS** = automated evidence on shipped path · **RESIDUAL** = environment-blocked or rendering-bound · **FAIL** = none remaining in scope.
+Legend: **PASS** = automated evidence on shipped path · **RESIDUAL** = environment-blocked or operator-bound · **FAIL** = none remaining in scope.
 
 ---
 
@@ -19,7 +19,7 @@ Legend: **PASS** = automated evidence on shipped path · **RESIDUAL** = environm
 | `editor_state` / `editor_compile` | **PASS** | FullLoop; compile clears CS* without console_clear |
 | `scene_manage` (get/list/list_opened/create/open/save/unload/set_active) | **PASS** | FullLoop scene-build; parity tests |
 | `hierarchy_get` compact + digDeeper | **PASS** | FullLoop; digDeeper names real tool |
-| `gameobject_manage` (+ find/tag/layer/primitive) | **PASS** | FullLoop; isolation |
+| `gameobject_manage` (+ find/tag/layer/primitive) | **PASS** | FullLoop; isolation; mutation post-state |
 | `component_manage` (+ list_types) | **PASS** | FullLoop; skill surface |
 | `assets_manage` (find/material/prefab/folder/copy/move/refresh/shaders) | **PASS** | FullLoop; skill surface core assets test |
 | `skill_manage` list/load/unload | **PASS** | Skill catalog + surface loads all 9 |
@@ -32,15 +32,15 @@ Legend: **PASS** = automated evidence on shipped path · **RESIDUAL** = environm
 
 | Skill | Tools | Status | Evidence |
 |-------|-------|--------|----------|
-| `testing` | tests_run, tests_list | **PASS** | `SkillSurfaceProductionTests` — non-empty results |
+| `testing` | tests_run, tests_list, tests_status | **PASS** | `SkillSurfaceProductionTests` + job poll (`AgentUxEnvelopeTests`) |
 | `prefab-advanced` | prefab_batch_instantiate, prefab_list | **PASS** | count=3 batch; list contains prefab |
 | `playmode` | playmode_control | **PASS** | play/pause/step/stop + editor_state |
 | `selection` | selection_manage | **PASS** | set/get returns GO id |
 | `packages` | package_manage | **PASS** | list non-empty; search cinemachine; add |
 | `menu` | menu_manage | **PASS** | list catalog; execute creates Sphere |
 | `profiling` | profiler_manage | **PASS** | start enabled=true; capture/save/load |
-| `screenshots` | screenshot_capture | **PASS** | non-empty payloadMarker (headless synthetic; live PNG when camera) |
-| `batch` | batch_execute | **PASS** | multi call content |
+| `screenshots` | screenshot_capture | **PASS (honest fail headless)** | headless → isError; live → MCP type:image; `isolated` = Ivan layer+staging cam (see §5) |
+| `batch` | batch_execute | **PASS** | multi call content; dryRun |
 
 ---
 
@@ -54,13 +54,16 @@ Legend: **PASS** = automated evidence on shipped path · **RESIDUAL** = environm
 
 ---
 
-## 4. Full agent loops
+## 4. Full agent loops + Phase E envelope
 
-| Loop | Status | Evidence |
-|------|--------|----------|
+| Loop / surface | Status | Evidence |
+|----------------|--------|----------|
 | Code-fix (no vacuous console_clear) | **PASS** | `FullLoop_CodeFix_*`, `CodeFix_recompile_clears_cs_errors_without_console_clear` |
 | Scene-build + isolation | **PASS** | `FullLoop_SceneBuild_*` |
 | Playmode-verify + screenshot | **PASS** | `FullLoop_PlaymodeVerify_*` |
+| Ok/Error envelope + nextStep | **PASS** | `AgentUxEnvelopeTests` |
+| Mutation post-state echo | **PASS** | same (GO/script/component) |
+| dryRun preview | **PASS** | delete/batch dryRun |
 
 ---
 
@@ -81,16 +84,33 @@ Legend: **PASS** = automated evidence on shipped path · **RESIDUAL** = environm
 | profiler real memory counters when possible | **PASS** | live Profiler.*; headless sampling metrics |
 | assets.find via AssetDatabase | **PASS** | live FindAssetsJson |
 | component modify applies properties | **PASS** | live SerializedObject apply (not fake true) |
-| screenshot camera PNG bytes on live bridge | **PASS** (code) | full `pngBase64` + `filePath` (no 2000-char truncation); headless marker tests |
-| agent vision: MCP `type:image` so Cursor/Codex/Doggy **really see** UI | **RESIDUAL / DEBT** | **Execution shortcut:** host returns `type:text` JSON with embedded base64 — NOT MCP image content. Do **not** claim Ivan screenshot parity for agents until fixed. Tracked: `docs/audit.md` → `VISION-MCP-IMAGE` |
-| Live Editor E2E in this sandbox | **RESIDUAL** | No controllable Unity instance required for gate; operator must open Editor to exercise live PackageManager/PNG. Documented — not claimed PASS. |
+| screenshot camera / ScreenCapture / scene_view on live bridge | **PASS** (code) | Coplay-ported CaptureComposited + camera.Render + GrabPixels; region crop native; whole-frame ≤640 |
+| screenshot `source=isolated` | **PASS** (code) | Ivan-style temp layer 31 + staging camera/light; layers/activeSelf restored in `finally`; limitations in JSON `note` (no Composite/custom lights; OnEnable side effects not rewindable) |
+| agent vision: MCP `type:image` | **CODE PASS / CLAIM BLOCKED** | Host emits `type:image` (`VisionProtocolTests`). Product claim still needs **AC-V6** live client transcript. Tracked: `docs/audit.md` + `docs/ops-loop.md` |
+| reload busy + compileEpoch / sessionGeneration | **PASS** (code) | Phase R + O1/O2; **SC10** Live kill-test still operator residual |
+| Live Editor E2E in this sandbox | **RESIDUAL** | No controllable Unity instance required for gate; operator must open Editor for PNG/consent/reload E2E. Documented — not claimed PASS. |
 
 ---
 
-## 6. Security
+## 6. Install (Phase I)
 
 | Item | Status | Evidence |
 |------|--------|----------|
+| FR-I1 Cursor/VS Code mcp/install deeplink | **PASS** (code) | `ClientConfigBuilder` + `UnityComdrWindow`; `ClientConfigBuilderTests` |
+| FR-I2 project-local relative host path config | **PASS** (code) | `.cursor/mcp.json` / `.vscode/mcp.json` / `.claude/mcp.json` / `.codex/config.toml` |
+| FR-I3 doctor (bridge/port/last call/host DLL) | **PASS** (code) | `DoctorChecks` / `DoctorReport` + Window |
+| Operator one-click Install in Editor | **RESIDUAL** | Needs human click in Window → Unity-Comdr MCP |
+
+---
+
+## 7. Trust (Phase T)
+
+| Item | Status | Evidence |
+|------|--------|----------|
+| FR-T1 first-connection consent (blocking) | **PASS** (code) | `BridgeTrust.EnsureConsent`; Core `ConsentState` in `TrustPolicyTests` |
+| FR-T2 per-tool / per-skill disable | **PASS** (code) | `TrustSettings` + live method disable + Window |
+| FR-T3 local invocation audit log | **PASS** (code) | `AppendAudit` / `MemoryAuditSink` |
+| Operator consent click | **RESIDUAL** | First live tool method must be Approved once (or pre-approved in Window) |
 | No forced cloud/login | **PASS** | host start path; SECURITY.md |
 | Escape hatches default off | **PASS** | gated test |
 | Bridge binds loopback only | **PASS** | `IPAddress.Loopback` |
@@ -98,28 +118,28 @@ Legend: **PASS** = automated evidence on shipped path · **RESIDUAL** = environm
 
 ---
 
-## 7. Ship gate
+## 8. Ship gate
 
 | Gate | Status | How to verify |
 |------|--------|----------------|
-| `dotnet test` | **PASS** | full suite (34+ tests) |
+| `dotnet test` | **PASS** | `dotnet test UnityComdr.sln -c Release` |
 | MCP host double launch | **PASS** | `McpHostProcessTests` + launch logs |
 | Go-live operator path | **PASS** | README Go-live + this audit |
-| Residual honesty | **PASS** | Live Editor E2E env + Runtime non-goal + **VISION-MCP-IMAGE** (agent must really see UI; text+base64 ≠ done) |
+| Residual honesty | **PASS** | AC-V6 transcript + SC10 kill-test + operator consent click listed open; Runtime non-goal |
 
 ---
 
-## 8. Decision
+## 9. Decision
 
 | Audience | Verdict |
 |----------|---------|
-| **Editor MCP production grade (shared host + skill surface)** | **GO** |
-| **Live Editor in operator machine** | **CONDITIONAL** — code path production-ready; requires Unity + package once for E2E confidence |
+| **Editor MCP production grade (shared host + skill surface)** | **GO** (0.4.0) |
+| **Live Editor on operator machine** | **CONDITIONAL** — code path production-ready; residuals: AC-V6 transcript, SC10 kill-test, consent click |
 | **Runtime in-game MCP** | **Out of surface** (separate product; not Editor MCP “全部能力”) |
 
 ---
 
-## 9. Test index (shipped CallAsync)
+## 10. Test index (shipped CallAsync)
 
 | Suite | Role |
 |-------|------|
@@ -129,6 +149,11 @@ Legend: **PASS** = automated evidence on shipped path · **RESIDUAL** = environm
 | `SkillAndToolCatalogTests` | Budget + escape + load/unload |
 | `P0HandlerTests` / `ParityAndDomainSkillTests` | Core depth |
 | `McpHostProcessTests` / `McpProtocolTests` | Host protocol |
+| `VisionProtocolTests` | MCP `type:image` + honest headless fail |
+| `AgentUxEnvelopeTests` | Phase E envelopes / mutation / dryRun / jobs |
+| `ClientConfigBuilderTests` | Phase I deeplink / relative config / doctor |
+| `TrustPolicyTests` | Phase T consent / disable / audit |
+| `ReloadResilienceTests` / `AccuracyEpochTests` | Phase R + O1/O2 |
 
 ```bash
 dotnet test UnityComdr.sln -c Release

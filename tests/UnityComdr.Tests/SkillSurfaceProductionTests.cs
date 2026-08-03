@@ -26,10 +26,18 @@ public class SkillSurfaceProductionTests
             Assert.False(load.IsError, $"load {id}: {load.Content}");
         }
 
-        // testing
+        // testing (Coplay-style job: tests_run → jobId/status, tests_status → results)
         var tests = await rt.Registry.CallAsync("tests_run", Obj(("mode", "EditMode")));
         Assert.False(tests.IsError);
-        Assert.Contains("results", tests.Content);
+        Assert.Contains("jobId", tests.Content);
+        Assert.Contains("status", tests.Content);
+        using (var startDoc = System.Text.Json.JsonDocument.Parse(tests.Content))
+        {
+            var jobId = startDoc.RootElement.GetProperty("data").GetProperty("jobId").GetString();
+            var status = await rt.Registry.CallAsync("tests_status", Obj(("jobId", jobId!)));
+            Assert.False(status.IsError, status.Content);
+            Assert.Contains("results", status.Content);
+        }
         var testsList = await rt.Registry.CallAsync("tests_list", null);
         Assert.False(testsList.IsError);
         Assert.Contains("Console_NoErrors", testsList.Content);
@@ -99,11 +107,11 @@ public class SkillSurfaceProductionTests
         Assert.False(profLoad.IsError);
         Assert.Contains("enabled", profLoad.Content);
 
-        // screenshots — non-empty payloadMarker
+        // screenshots — headless vision fails honestly (not marker success)
         var shot = await rt.Registry.CallAsync("screenshot_capture", Obj(("source", "game_view")));
-        Assert.False(shot.IsError);
-        Assert.Contains("payloadMarker", shot.Content);
-        Assert.True(shot.Content.Length > 40);
+        Assert.True(shot.IsError);
+        Assert.DoesNotContain("payloadMarker", shot.Content);
+        Assert.Contains("real pixels", shot.Content, StringComparison.OrdinalIgnoreCase);
 
         // batch
         var batch = await rt.Registry.CallAsync("batch_execute", Obj(

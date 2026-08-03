@@ -4,7 +4,7 @@
 
 | | |
 |--|--|
-| Package | `com.unitycomdr.mcp` **0.2.0** |
+| Package | `com.unitycomdr.mcp` **0.4.0** |
 | Host | `UnityComdr.McpHost` (.NET 8, stdio JSON-RPC) |
 | Default tools | **≤ 15** core entrypoints |
 | Skills | **9** domain packs (load on demand) |
@@ -22,6 +22,7 @@
 Full matrix: [`docs/competitive-audit-full.md`](docs/competitive-audit-full.md)  
 **Launch go/no-go:** [`docs/launch-readiness.md`](docs/launch-readiness.md)  
 **Production capability audit (all Editor skills/core):** [`docs/production-capability-audit.md`](docs/production-capability-audit.md)  
+**Borrow plan (file-level, AI-first pain points):** [`docs/borrow-plan.md`](docs/borrow-plan.md)  
 Security defaults: [`SECURITY.md`](SECURITY.md)
 
 ## Go-live (local open-source)
@@ -33,10 +34,11 @@ Complete operator path (no prior session needed):
 | 1 | Install UPM package from `packages/com.unitycomdr.mcp` (file: or git `?path=/packages/com.unitycomdr.mcp`) |
 | 2 | Build host: `dotnet build UnityComdr.sln -c Release` |
 | 3 | Gate: `dotnet test UnityComdr.sln -c Release` (must exit 0) |
-| 4 | Point MCP client at `src/UnityComdr.McpHost/bin/Release/net8.0/UnityComdr.McpHost.dll` via `dotnet exec` |
-| 5 | Optional live Editor: open Unity with package → bridge auto-starts on `127.0.0.1:17890` |
-| 6 | Optional CI headless: set `UNITY_COMDR_FORCE_HEADLESS=1` (or leave unset; host falls back if bridge down) |
-| 7 | Override bridge port: `UNITY_COMDR_BRIDGE_PORT=17890` |
+| 4 | In Unity **Window → Unity-Comdr MCP**: use **Open install deeplink** (Cursor / VS Code) or **Write project-local config** (relative host path into `.cursor/mcp.json` / `.vscode/mcp.json` / `.claude/mcp.json` / `.codex/config.toml`). Copy-JSON remains as fallback. |
+| 5 | Or manually point the client at `src/UnityComdr.McpHost/bin/Release/net8.0/UnityComdr.McpHost.dll` via `dotnet exec` |
+| 6 | Optional live Editor: open Unity with package → bridge auto-starts on `127.0.0.1:17890` — use the Doctor foldout to confirm listening / last client call / host DLL |
+| 7 | Optional CI headless: set `UNITY_COMDR_FORCE_HEADLESS=1` (or leave unset; host falls back if bridge down) |
+| 8 | Override bridge port: `UNITY_COMDR_BRIDGE_PORT=17890` |
 
 **Requirements:** Unity 2021.3+ for live Editor path. **No Python, Node, or cloud login** for local control.
 
@@ -54,7 +56,7 @@ Or:
 https://github.com/<you>/Unity-Comdr.git?path=/packages/com.unitycomdr.mcp
 ```
 
-Open **Window → Unity-Comdr MCP** for bridge status and multi-client config copy.
+Open **Window → Unity-Comdr MCP** for bridge status, Cursor/VS Code deeplinks, project-local config write, Doctor self-test, and copy-JSON fallback.
 
 ### 2) Build MCP host
 
@@ -71,6 +73,10 @@ dotnet publish src/UnityComdr.McpHost/UnityComdr.McpHost.csproj -c Release -r wi
 
 ### 3) MCP client config
 
+**Preferred (≤5 min):** Unity window → deeplink (Cursor/VS Code) or **Write project-local config** so the host path is project-relative when the DLL lives under the Unity project (e.g. `src/UnityComdr.McpHost/bin/Release/net8.0/UnityComdr.McpHost.dll`).
+
+Manual / copy-JSON fallback:
+
 ```json
 {
   "mcpServers": {
@@ -78,19 +84,19 @@ dotnet publish src/UnityComdr.McpHost/UnityComdr.McpHost.csproj -c Release -r wi
       "command": "dotnet",
       "args": [
         "exec",
-        "C:/Ai/Unity-Comdr/src/UnityComdr.McpHost/bin/Release/net8.0/UnityComdr.McpHost.dll"
+        "src/UnityComdr.McpHost/bin/Release/net8.0/UnityComdr.McpHost.dll"
       ]
     }
   }
 }
 ```
 
-Codex CLI (`config.toml`):
+Codex CLI (`config.toml` fragment — window can write `.codex/config.toml`):
 
 ```toml
 [mcp_servers.unity-comdr]
 command = "dotnet"
-args = ["exec", "C:/Ai/Unity-Comdr/src/UnityComdr.McpHost/bin/Release/net8.0/UnityComdr.McpHost.dll"]
+args = ["exec", "src/UnityComdr.McpHost/bin/Release/net8.0/UnityComdr.McpHost.dll"]
 ```
 
 For headless-only sessions, add env in your MCP client config if supported:

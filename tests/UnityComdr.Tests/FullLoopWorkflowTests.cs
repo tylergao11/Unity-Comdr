@@ -197,10 +197,10 @@ public class FullLoopWorkflowTests
 
         var loadShot = await rt.Registry.CallAsync("skill_manage", Obj(("action", "load"), ("id", DomainSkills.ScreenshotsId)));
         Assert.False(loadShot.IsError);
+        // Headless cannot see — vision must fail honestly (AC-V5 / L2), not succeed with a marker.
         var shot = await rt.Registry.CallAsync("screenshot_capture", Obj(("source", "game_view")));
-        Assert.False(shot.IsError);
-        Assert.False(string.IsNullOrWhiteSpace(shot.Content));
-        Assert.Contains("payloadMarker", shot.Content);
+        Assert.True(shot.IsError);
+        Assert.Contains("real pixels", shot.Content, StringComparison.OrdinalIgnoreCase);
 
         // Unload keeps budget discipline
         await rt.Registry.CallAsync("skill_manage", Obj(("action", "unload"), ("id", DomainSkills.PlayModeId)));

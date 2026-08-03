@@ -17,7 +17,20 @@
 | P4 | **Honest audits**: PASS/RESIDUAL/DEBT discipline; no fake-done | production-capability-audit; audit.md | Healthy — and the reason this doc exists: the VISION-* rows are open debts, not closed features. |
 | P5 | **Three loops as the product**: code-fix, scene-build, playmode-verify | README Full agent loops; prompts | Aging at the edges — playmode-verify currently ends at a screenshot the agent **cannot actually see** (text+base64). The loop does not close. |
 
-**One-line thesis check:** the "token-frugal, zero-runtime" identity is intact and still wins. The part that has fallen behind the frontier is **what happens after the agent acts** — verification by sight, install friction, and behavior during Editor transitions.
+**One-line thesis check:** the "token-frugal, zero-runtime" identity is intact — but **only as layer two**. Product order of merit (2026-08-03 lock): **(1) 精准 / 准确 first** — what the agent sees, does, and is told must be faithful to the live Editor; **(2) 节省 / 优化 second** — schema caps, pagination, vision downscale, composites sit *on top of* accuracy and may never fake, truncate-into-lie, or marker-success a verification path. The part that has fallen behind the frontier is **what happens after the agent acts** — verification by sight, install friction, and behavior during Editor transitions.
+
+---
+
+## 0. Priority lock — Accuracy before thrift（精准优先于节省）
+
+| Order | Concern | Means | Forbidden |
+|-------|---------|-------|-----------|
+| **1st** | **精准 / 准确** | Real MCP image modality; true overlay-UI pixels when claiming game-view; honest busy/error states; structure+pixels that match the Editor; no fake-done audits | Marker-as-success; text+base64 sold as "seeing"; headless synthetic as vision PASS; omitting Overlay UI to "save work"; lying truncation |
+| **2nd** | **节省 / 优化** | ≤15 default tools; skill on-demand; pagination; default ≤640px; contact sheets; compact digDeeper | Any optimization that breaks order-1 fidelity |
+
+**Decision rule for every design/exec trade-off:** if a cheaper path would make the agent less accurate about the Editor, reject it. Optimize only after the truthful path exists.
+
+This supersedes any reading of the 2026-08-02 "Primary — LLM token cost" cost model as permission to ship inaccurate verification. Token thrift remains a differentiator; it is **not** the first product virtue.
 
 ---
 
@@ -58,14 +71,16 @@ Ranked by value to one solo developer working with Cursor / Codex / Doggy — no
 | **G5** | **Trust surface below official bar** | Unity official pending-connection approval + per-tool toggles | Loopback bind + escape hatches off; no consent moment, no per-tool disable, no invocation log | Medium-high. One agent deleting one wrong asset destroys solo trust permanently. Consent + visibility is cheap insurance. |
 | **G6** | **"See UI" ≠ pixels only** | Coplay ScreenCapture-includes-overlay-UI nuance; Ivan `screenshot-isolated`; Coder `unity://gameobject/{id}` serialized detail | `hierarchy_get` is generic; no uGUI/UIToolkit-aware structured read; overlay-UI capture semantics undefined | Medium. For UI bugs the agent needs both the picture *and* the RectTransform/anchor truth. Pixels catch "looks wrong", structure explains *why*. |
 | **G7** | **Multi-instance routing** | Unity official targets by project path / PID | Single port 17890, first-come | Medium-low for solos (usually one Editor), but cheap to design now, expensive to retrofit. |
+| **G8** | **Detail-fidelity loop（细节精修闭环）** | **实测证据 2026-08-03**：最强模型（Fable）经 unity-mcp 搭建落霞 MainWorld UI——大体结构正确，细节稀烂（小地图黑饼、头像栏文字挤压、间距无节奏、无字重层级、无花纹质感）。根因＝符号通道（hierarchy）通、像素通道（细节反馈）堵 | 无 region crop / 无参考稿对比 / 写侧盲打（数字进 true 出）/ 无 design token / 素材断层 | **High.** 这是"拼得出"与"拿得出手"的分界线。五层根因：①细节看不见（整屏低清）②写侧无视觉回读 ③无对稿 diff 工具 ④美术资产断层 ⑤迭代太贵→satisfice。换更强模型无效，瓶颈在通道。 |
 
 ---
 
 ## 4. Proposed product principles (v1 — for 定案)
 
-- **PR-1 The loop is the product.** A capability earns a core slot only if it closes or shortens one of the three loops. Feature-checklist parity is a skills concern, never a core concern.
-- **PR-2 Seeing has a budget, like schemas do.** Default capture ≤ 640 px longest edge; multi-angle capture returns **one** composite image; every vision-capable tool documents its approximate vision-token price. The 15-tool budget gets a sibling: the **vision budget**.
-- **PR-3 Never fake sight（不假装看见）.** A synthetic marker, a file path, or base64-inside-text **never** counts as the agent seeing. When real pixels are impossible (headless, no camera), return an explicit machine-readable failure — honest blindness over fake vision. This principle is the product-level form of the `VISION-*` debts.
+- **PR-0 Accuracy before thrift（精准 > 节省）.** First: the agent’s picture of the Editor (pixels, hierarchy, console, busy states) must be *correct*. Second: shrink schemas, results, and vision payloads. Never invert this. See §0.
+- **PR-1 The loop is the product.** A capability earns a core slot only if it closes or shortens one of the three loops. Feature-checklist parity is a skills concern, never a core concern. A loop that “passes” with inaccurate feedback is not closed.
+- **PR-2 Seeing has a budget — after it is real.** Default capture ≤ 640 px longest edge; multi-angle capture returns **one** composite image; every vision-capable tool documents its approximate vision-token price. Caps and composites are **order-2 optimizations**; they must not drop Overlay UI, substitute markers, or change content type away from MCP `image` to save tokens.
+- **PR-3 Never fake sight（不假装看见）.** A synthetic marker, a file path, or base64-inside-text **never** counts as the agent seeing. When real pixels are impossible (headless, no camera), return an explicit machine-readable failure — honest blindness over fake vision. This principle is the product-level form of the `VISION-*` debts. **Accuracy debt beats thrift debt.**
 - **PR-4 Five minutes to trusted first call.** Install → configured client → first successful verified tool call in ≤ 5 minutes, and every trust escalation (first connection, escape hatches, destructive ops) is a visible, revocable moment — not a buried default.
 - **PR-5 Predictable failure beats silent retry.** Domain reload, compile, play transitions, and closed Editors must yield machine-readable states with retry guidance ("editor_reloading, retry ~5s"), never hangs or fake successes. Agents can handle bad news; they cannot handle no news.
 - **PR-6 Absorb patterns, not dependencies.** We adopt Coplay's contact sheets, Coder's committable config, official's consent UX — as *patterns* in pure C#. We do not adopt Python, Node, WebView dashboards, or cloud relays to get them.
@@ -79,13 +94,15 @@ The four conditions in [`docs/audit.md`](audit.md) §Known execution shortcuts r
 | ID | Acceptance criterion | Closes / relates |
 |----|----------------------|------------------|
 | AC-V1 | `tools/call` → `screenshot_capture` returns an MCP content block `{"type":"image","data":<base64 png>,"mimeType":"image/png"}` per MCP spec 2026-07-28 — not text with embedded base64 | `VISION-MCP-IMAGE` |
-| AC-V2 | Default capture is downscaled to ≤ 640 px longest edge; caller may raise the cap explicitly; the tool description states the default and its purpose (vision-token cost) | G2 |
+| AC-V2 | Default capture is downscaled to ≤ 640 px longest edge **only after** AC-V1/AC-V3 fidelity holds; caller may raise the cap explicitly; tool description states default is a *cost* knob, not a license to omit Overlay UI or degrade to text | G2 (order-2) |
 | AC-V3 | Game-view capture **includes Screen Space – Overlay UI by default** (ScreenCapture-style path); camera-specific capture documents that overlay canvases are excluded — the difference is stated in the tool result, not just docs | G6, `VISION-SCENE-VIEW` |
 | AC-V4 | Scene without any camera: `scene_view`/`game_view` capture returns an explicit machine-readable failure (`isError` or documented error payload naming the cause) — never a marker or silent placeholder success | `VISION-SCENE-VIEW` |
 | AC-V5 | Headless host (`InMemoryEditorHost` / bridge down): vision tools return an explicit "no live Editor — cannot capture real pixels" failure; synthetic markers may exist only for non-vision plumbing tests and are never presented as capture success | `VISION-LIVE-ONLY` |
 | AC-V6 | **Human-verified vision protocol:** in a real Cursor/Codex session against a live Editor showing a known fixture (e.g. a red cube upper-left, scene name on a UI label), the agent calls `screenshot_capture` and then correctly describes the fixture **from the image alone**. Session evidence (log or transcript) recorded | audit.md condition 3 |
 | AC-V7 | Multi-angle capture (when designed) returns **one labeled composite** (contact sheet), not N separate images | G2 |
 | AC-V8 | No CI/headless test (`SkillSurfaceProductionTests` or successors) is cited as evidence of vision acceptance; only live-bridge + client-modality evidence counts | audit.md condition 4 |
+| AC-V9 | **Region crop at native resolution:** caller can capture a screen region (rect or target UI element) at **native/unscaled resolution** for detail QA. The 640px default cap applies to whole-frame captures only — never to region crops. 细节精修不允许被"省"掉 | G8, PR-0 |
+| AC-V10 | **UI 精修闭环可执行：** agent 能完成「region crop → 与参考稿对比 → 改 RectTransform/样式 → 再 crop 验证」的收敛循环；写操作返回受影响元素的视觉回读（新 rect + 可选即时 crop） | G8 |
 
 **关系声明：** audit.md 是债务台账（authoritative ledger）；本节是这些债务的产品验收口径（product acceptance）。两处必须同时满足才能关闭 `VISION-*`。
 

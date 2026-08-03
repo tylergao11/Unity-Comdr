@@ -33,22 +33,25 @@
 
 ## Known execution shortcuts（禁止当对齐完成）
 
+> **优先级锁：** 精准/准确 **先于** 节省/优化。不得为省 token、省工、过 CI 而交付不准的看见/状态。  
 > 产品意图：Codex / Cursor / Doggy 等 agent 经 MCP **真正看见** Unity 运行/UI 画面（对齐 IvanMurzak screenshot 能力）。  
 > **不得**用“有截图工具 / 有 base64 字段 / headless marker PASS”宣称已满足。  
+> 定案：[`docs/product-ux-frontier.md`](product-ux-frontier.md) §0 / PR-0；需求修正：[`docs/brainstorms/2026-08-03-ux-frontier-addendum.md`](brainstorms/2026-08-03-ux-frontier-addendum.md)。  
+> 执行抄点清单（唯一有效）：[`docs/borrow-plan.md`](borrow-plan.md) — 具体抄谁/抄哪个文件/怎么抄 + AI-first 痛点 A1–A10。  
 > 产品验收口径（AC-V1…AC-V8，含 vision 预算与 capture 语义）见 [`docs/product-ux-frontier.md`](product-ux-frontier.md) §5 —— 本表仍是债务台账（authoritative ledger），两处须同时满足方可关闭。
 
-| 债务 ID | 现状（偷懒点） | 何谓真正完成 | 证据位置 |
-|---------|----------------|--------------|----------|
-| `VISION-MCP-IMAGE` | `screenshot_capture` 经 `McpServer.ToolsCallResult` 只回 `content[].type = "text"`，把 `pngBase64` 塞进 JSON 字符串 | MCP 工具结果含标准 **`type: "image"`**（或客户端约定的 image content），vision agent 可直接当图看，而不是自己解析巨型 text | `src/UnityComdr.McpHost/McpServer.cs`（text-only）；`LiveUnityBridgeServer.CaptureScreenshotJson`（有 PNG 但未升格为 image content） |
-| `VISION-LIVE-ONLY` | headless `InMemoryEditorHost.CaptureScreenshot` 只返回 synthetic `payloadMarker` | Live Editor + bridge 下真实像素；CI 不得用 marker 冒充“看见了” | `InMemoryEditorHost.cs`；`production-capability-audit.md` screenshots 行 |
-| `VISION-SCENE-VIEW` | 无 Camera 时 `scene_view` / `game_view` 退回 marker note | Scene/Game 视图在无 Main Camera 时仍有可用画面路径（或明确失败，不假成功） | `LiveUnityBridgeServer.CaptureScreenshotJson` |
+| 债务 ID | 状态（Round-1 audit 2026-08-03） | 何谓真正完成 | 证据位置 |
+|---------|----------------------------------|--------------|----------|
+| `VISION-MCP-IMAGE` | **CODE PASS / CLAIM BLOCKED** — host 已发 `type:image`；全文宣称仍需 AC-V6 实会话 | MCP `type:image` + Cursor/Codex 从图像描述 fixture | `McpServer.ToolsCallResult`; `VisionProtocolTests`; `ToolResult.OkWithImages` |
+| `VISION-LIVE-ONLY` | **CODE PASS** — headless `IsRealPixels=false` → `isError`；CI 不能当看见了 | Live 真像素；headless 必须失败 | `InMemoryEditorHost.CaptureScreenshot`; VisionProtocolTests |
+| `VISION-SCENE-VIEW` | **CODE PASS (partial)** — 无相机/无 SceneView → Fail；GrabPixels 已接。`isolated` 尚未 Ivan 真隔离 | 真抓取或显式错误；永不 marker 成功；isolated staging 仍 open | `LiveUnityBridgeServer.CaptureScreenshotJson` |
 
 **验收口径（以后任何 agent/审计勾选“能看见 UI”必须同时满足）：**
 
 1. Live Unity 桥开着；  
 2. `tools/call` → `screenshot_capture` 返回 **image content**（非仅 text+base64）；  
-3. Cursor / Codex 类客户端会话里模型实际吃到图像模态（人工或客户端日志可证）；  
-4. 不得仅凭 `SkillSurfaceProductionTests` / headless marker 关闭本债务。
+3. Cursor / Codex 类客户端会话里模型实际吃到图像模态（人工或客户端日志可证）——**Round-1 未完成，CLAIM BLOCKED**；  
+4. 不得仅凭 headless / `VisionProtocolTests` fixture 关闭「产品已看见」宣称（协议锁可以，产品宣称不行）。
 
 ## Upstream
 

@@ -51,16 +51,23 @@ A **local-first Unity MCP** that:
 
 ## Cost model (priority order)
 
-1. **Primary — LLM token cost**  
+> **Amended 2026-08-03:** fidelity outranks thrift. See [`2026-08-03-ux-frontier-addendum.md`](2026-08-03-ux-frontier-addendum.md) Priority correction and [`docs/product-ux-frontier.md`](../product-ux-frontier.md) §0.
+
+1. **Primary — 精准 / 准确 (fidelity)**  
+   - Agent-visible Editor state must be truthful (vision = real MCP image + correct pixels; console/hierarchy/busy states honest).  
+   - No fake-done, marker-as-sight, or optimization that lies.
+
+2. **Secondary — LLM token / result thrift（在准确之上）**  
    - Small default tool set (~15 core entrypoints).  
    - Domain capability via **Skills** loaded on demand.  
    - Compact tool results (summaries, pagination, path-scoped queries — not full hierarchy dumps by default).  
-   - Optional reflect/execute as **escape hatches**, not always-on schema weight.
+   - Optional reflect/execute as **escape hatches**, not always-on schema weight.  
+   - Vision caps/composites only after sight is real.
 
-2. **Secondary — user money**  
+3. **Tertiary — user money**  
    - Free to run for local Editor control; no mandatory subscription or cloud account.
 
-3. **Tertiary — install/ops cost**  
+4. **Quaternary — install/ops cost**  
    - Prefer zero host runtimes beyond Unity + MCP client.  
    - Accept optional self-hosted relay later; never required for MVP.
 

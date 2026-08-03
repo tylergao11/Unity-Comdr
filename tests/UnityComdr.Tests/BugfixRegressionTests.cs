@@ -68,10 +68,11 @@ public class BugFixRegressionTests
 
         var get = await rt.Registry.CallAsync("gameobject_manage", Obj(("action", "get"), ("target", "Cube")));
         Assert.False(get.IsError);
-        // Expect position (1, 9, 3) — not (0, 9, 0). Parse structured transform.
+        // Expect position (1, 9, 3) — not (0, 9, 0). Parse structured transform (O3 envelope → data).
         var node = JsonNode.Parse(get.Content) as JsonObject;
         Assert.NotNull(node);
-        var pos = node!["transform"]?["position"] as JsonObject;
+        var data = node!["data"] as JsonObject ?? node;
+        var pos = data!["transform"]?["position"] as JsonObject;
         Assert.NotNull(pos);
         Assert.Equal(1f, pos!["x"]!.GetValue<float>(), precision: 3);
         Assert.Equal(9f, pos["y"]!.GetValue<float>(), precision: 3);

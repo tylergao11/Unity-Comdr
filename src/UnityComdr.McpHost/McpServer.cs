@@ -197,14 +197,39 @@ public sealed class McpServer
             result = ToolResult.Error(ex.Message);
         }
 
-        var content = new JsonArray
+        var content = new JsonArray();
+        if (!string.IsNullOrEmpty(result.Content))
         {
-            new JsonObject
+            content.Add(new JsonObject
             {
                 ["type"] = "text",
                 ["text"] = result.Content
+            });
+        }
+
+        // MCP spec image content blocks — never embed PNG solely inside type:text.
+        if (result.Images is { Count: > 0 })
+        {
+            foreach (var img in result.Images)
+            {
+                if (string.IsNullOrEmpty(img.DataBase64)) continue;
+                content.Add(new JsonObject
+                {
+                    ["type"] = "image",
+                    ["data"] = img.DataBase64,
+                    ["mimeType"] = string.IsNullOrEmpty(img.MimeType) ? "image/png" : img.MimeType
+                });
             }
-        };
+        }
+
+        if (content.Count == 0)
+        {
+            content.Add(new JsonObject
+            {
+                ["type"] = "text",
+                ["text"] = result.IsError ? "error" : ""
+            });
+        }
 
         return new JsonObject
         {

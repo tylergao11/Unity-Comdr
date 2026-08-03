@@ -86,8 +86,17 @@ public interface IEditorHost
     IReadOnlyList<MenuItemInfo> ListMenuItems(string? filter = null);
     bool ExecuteMenuItem(string menuPath);
 
-    // Screenshots (IvanMurzak parity — headless returns markers)
-    ScreenshotResult CaptureScreenshot(string source, string? targetId = null, int width = 1280, int height = 720);
+    // Screenshots — live returns real pixels; headless returns IsRealPixels=false (honest blindness).
+    ScreenshotResult CaptureScreenshot(
+        string source,
+        string? targetId = null,
+        int width = 1280,
+        int height = 720,
+        int maxResolution = 640,
+        int? regionX = null,
+        int? regionY = null,
+        int? regionWidth = null,
+        int? regionHeight = null);
 
     // Profiler (IvanMurzak parity — headless synthetic)
     ProfilerSnapshot GetProfilerSnapshot();

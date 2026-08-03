@@ -33,6 +33,10 @@ public sealed class PromptCatalog
             "2) Identify file paths from messages; script_read those files.\n" +
             "3) Apply script_write fixes; call editor_compile.\n" +
             "4) console_read again until total errors is 0.\n" +
+            "Retry etiquette (required): script_write/editor_compile often trigger compile or domain reload. " +
+            "If a tool returns isError containing editor_compiling, editor_reloading, play_transition, or editor_gone, " +
+            "read suggestedRetrySeconds / nextStep, wait, optionally poll editor_state until phase=connected, then retry the same call. " +
+            "Never treat a hang, socket timeout, or missing result as success; never invent console/compile outcomes.\n" +
             "Do not ask the user to paste console text.",
         "scene_build_loop" =>
             "You are building a Unity scene via Unity-Comdr MCP.\n" +

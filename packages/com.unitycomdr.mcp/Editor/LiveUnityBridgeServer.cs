@@ -26,6 +26,12 @@ namespace UnityComdr.UnityEditor
         public const int DefaultPort = 17890;
         public static bool IsRunning { get; private set; }
         public static string Status { get; private set; } = "Stopped";
+        /// <summary>Port the listener bound to (FR-I3 doctor).</summary>
+        public static int ListeningPort { get; private set; } = DefaultPort;
+        /// <summary>UTC time of last inbound client request line (FR-I3 doctor).</summary>
+        public static DateTime? LastClientCallUtc { get; private set; }
+        /// <summary>Method of last inbound client request (FR-I3 doctor).</summary>
+        public static string LastMethod { get; private set; }
 
         private static TcpListener _listener;
         private static CancellationTokenSource _cts;
@@ -34,6 +40,15 @@ namespace UnityComdr.UnityEditor
         private static Thread _acceptThread;
         private static bool _profilerEnabled;
         private static readonly Dictionary<string, string> ProfilerSaves = new Dictionary<string, string>();
+        private static string _leaseHolder;
+        private static DateTime _leaseExpiresUtc;
+        // FR-R1: background-safe busy flags so TCP thread can return immediate busy (PR-5: no silent queue).
+        private static volatile bool _isCompiling;
+        private static volatile bool _isReloading;
+        private static volatile bool _playTransition;
+        // O1/O2: persist across domain reload via SessionState (statics reset on reload).
+        private const string SessionGenerationKey = "UnityComdr.SessionGeneration";
+        private const string CompileEpochKey = "UnityComdr.CompileEpoch";
         private static readonly string[] BuiltinMenuCatalog =
         {
             "GameObject/Create Empty",
@@ -56,8 +71,62 @@ namespace UnityComdr.UnityEditor
         {
             Application.logMessageReceivedThreaded += OnLog;
             EditorApplication.delayCall += StartIfEnabled;
-            AssemblyReloadEvents.beforeAssemblyReload += Stop;
-            EditorApplication.quitting += Stop;
+            EditorApplication.update += RefreshBusyFlags;
+            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+            AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
+            EditorApplication.quitting += OnEditorQuitting;
+        }
+
+        private static void RefreshBusyFlags()
+        {
+            _isCompiling = EditorApplication.isCompiling;
+        }
+
+        private static void OnPlayModeStateChanged(PlayModeStateChange change)
+        {
+            switch (change)
+            {
+                case PlayModeStateChange.ExitingEditMode:
+                case PlayModeStateChange.ExitingPlayMode:
+                    _playTransition = true;
+                    break;
+                case PlayModeStateChange.EnteredEditMode:
+                case PlayModeStateChange.EnteredPlayMode:
+                    _playTransition = false;
+                    break;
+            }
+        }
+
+        private static void OnBeforeAssemblyReload()
+        {
+            _isReloading = true;
+            // Stop listener so clients observe disconnect as editor_reloading (not a hang).
+            Stop();
+        }
+
+        private static void OnAfterAssemblyReload()
+        {
+            // O2: bump sessionGeneration so clients know prior instance ids are invalid.
+            SessionState.SetInt(SessionGenerationKey, GetSessionGeneration() + 1);
+            _isReloading = false;
+            _playTransition = false;
+            _isCompiling = EditorApplication.isCompiling;
+        }
+
+        private static int GetSessionGeneration() =>
+            SessionState.GetInt(SessionGenerationKey, 1);
+
+        private static int GetCompileEpoch() =>
+            SessionState.GetInt(CompileEpochKey, 0);
+
+        private static void BumpCompileEpoch() =>
+            SessionState.SetInt(CompileEpochKey, GetCompileEpoch() + 1);
+
+        private static void OnEditorQuitting()
+        {
+            _isReloading = true;
+            Stop();
         }
 
         private static void OnLog(string condition, string stackTrace, LogType type)
@@ -71,7 +140,8 @@ namespace UnityComdr.UnityEditor
                     Message = condition ?? "",
                     StackTrace = stackTrace,
                     File = null,
-                    Line = 0
+                    Line = 0,
+                    Epoch = GetCompileEpoch()
                 });
                 if (Logs.Count > 2000)
                     Logs.RemoveRange(0, Logs.Count - 1500);
@@ -100,6 +170,7 @@ namespace UnityComdr.UnityEditor
                 _listener = new TcpListener(IPAddress.Loopback, port);
                 _listener.Start();
                 IsRunning = true;
+                ListeningPort = port;
                 Status = $"Listening 127.0.0.1:{port}";
                 _acceptThread = new Thread(() => AcceptLoop(_cts.Token)) { IsBackground = true, Name = "UnityComdrBridge" };
                 _acceptThread.Start();
@@ -121,6 +192,7 @@ namespace UnityComdr.UnityEditor
             Status = "Stopped";
             _listener = null;
             _cts = null;
+            // Keep ListeningPort / LastClientCallUtc for doctor after stop.
         }
 
         private static void AcceptLoop(CancellationToken ct)
@@ -167,9 +239,18 @@ namespace UnityComdr.UnityEditor
                     if (line == null) break;
                     if (string.IsNullOrWhiteSpace(line)) continue;
 
+                    // PR-5: immediate busy on TCP thread — never queue silently during transitions.
+                    var earlyBusy = TryImmediateBusyResponse(line);
+                    if (earlyBusy != null)
+                    {
+                        try { writer.WriteLine(earlyBusy); }
+                        catch { break; }
+                        continue;
+                    }
+
                     string responseJson = null;
                     var done = new ManualResetEventSlim(false);
-                    // Unity API must run on main thread.
+                    // Unity API must run on main thread (CoderGamester-style pump: drain on main via delayCall).
                     EditorApplication.delayCall += () =>
                     {
                         try
@@ -186,27 +267,150 @@ namespace UnityComdr.UnityEditor
                         }
                     };
                     if (!done.Wait(20000))
-                        responseJson = Fail(null, "Editor main thread timeout");
+                        responseJson = Fail(null, FormatBusyError("editor_reloading", 5,
+                            "Editor main thread timeout (likely reload/compile). Wait and retry."));
                     try { writer.WriteLine(responseJson ?? Fail(null, "empty response")); }
                     catch { break; }
                 }
             }
         }
 
+        /// <summary>
+        /// Returns a busy Fail response without waiting on the main thread when Editor is transitioning.
+        /// Allows ping + editor.getState through so agents can poll lifecycle.
+        /// </summary>
+        private static void RecordClientCall(string method)
+        {
+            if (string.IsNullOrEmpty(method)) return;
+            LastClientCallUtc = DateTime.UtcNow;
+            LastMethod = method;
+        }
+
+        private static string TryImmediateBusyResponse(string line)
+        {
+            var method = ExtractString(line, "method");
+            RecordClientCall(method);
+            var id = ExtractString(line, "id") ?? Guid.NewGuid().ToString("N");
+            if (string.IsNullOrEmpty(method))
+                return null;
+            if (string.Equals(method, "ping", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(method, "editor.getState", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            string phase;
+            int retry;
+            string next;
+            if (_isReloading)
+            {
+                phase = "editor_reloading";
+                retry = 5;
+                next = "Wait for domain reload to finish, reconnect if needed, then retry.";
+            }
+            else if (_playTransition)
+            {
+                phase = "play_transition";
+                retry = 2;
+                next = "Wait for play-mode enter/exit to settle, then retry.";
+            }
+            else if (_isCompiling)
+            {
+                phase = "editor_compiling";
+                retry = 3;
+                next = "Wait for Unity compile to finish, then retry the same tool call.";
+            }
+            else
+                return null;
+
+            return Fail(id, FormatBusyError(phase, retry, next));
+        }
+
+        private static string FormatBusyError(string phase, int suggestedRetrySeconds, string nextStep) =>
+            phase + " suggestedRetrySeconds=" + suggestedRetrySeconds + " nextStep=" + nextStep;
+
+        private static string CurrentPhase()
+        {
+            if (_isReloading) return "editor_reloading";
+            if (_playTransition) return "play_transition";
+            if (_isCompiling || EditorApplication.isCompiling) return "editor_compiling";
+            return "connected";
+        }
+
+        private static int? SuggestedRetryForPhase(string phase)
+        {
+            if (phase == "editor_compiling") return 3;
+            if (phase == "editor_reloading") return 5;
+            if (phase == "play_transition") return 2;
+            if (phase == "editor_gone") return 5;
+            return null;
+        }
+
         private static string Dispatch(string line)
         {
             // Minimal JSON parse without Core dependency (Unity package is standalone).
             var method = ExtractString(line, "method");
+            RecordClientCall(method);
             var id = ExtractString(line, "id") ?? Guid.NewGuid().ToString("N");
             if (string.IsNullOrEmpty(method))
                 return Fail(id, "missing method");
 
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            string response = null;
             try
             {
+                response = DispatchCore(line, method, id);
+                return response;
+            }
+            finally
+            {
+                sw.Stop();
+                // FR-T3: audit tool methods by default (doctor probes skipped to keep doctor quiet).
+                if (!BridgeTrust.IsDoctorMethod(method))
+                {
+                    var ok = response != null && response.IndexOf("\"ok\":true", StringComparison.Ordinal) >= 0;
+                    string err = null;
+                    if (!ok && response != null)
+                        err = ExtractString(response, "error");
+                    BridgeTrust.AppendAudit(method, ok, sw.ElapsedMilliseconds, err);
+                }
+            }
+        }
+
+        private static string DispatchCore(string line, string method, string id)
+        {
+            try
+            {
+                _isCompiling = EditorApplication.isCompiling;
+
+                // FR-T1: first-connection consent (blocking). Doctor probes remain available.
+                string consentError;
+                if (!BridgeTrust.EnsureConsent(method, out consentError))
+                    return Fail(id, consentError);
+
+                // FR-T2: optional per-method disable via ProjectSettings/UnityComdr.mcp.json
+                var trust = BridgeTrust.LoadConfig();
+                if (BridgeTrust.IsBridgeMethodDisabled(method, trust))
+                    return Fail(id, "tool_disabled: Bridge method '" + method +
+                                    "' is disabled in ProjectSettings/UnityComdr.mcp.json.");
+
+                // Main-thread busy gate (race with TCP-thread early check).
+                if (!string.Equals(method, "ping", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(method, "editor.getState", StringComparison.OrdinalIgnoreCase))
+                {
+                    var busy = TryImmediateBusyResponse(line);
+                    if (busy != null) return busy;
+                }
+
                 switch (method)
                 {
                     case "ping":
-                        return Ok(id, "{\"pong\":true}");
+                    {
+                        var phase = CurrentPhase();
+                        var retry = SuggestedRetryForPhase(phase);
+                        return Ok(id, "{\"pong\":true,\"phase\":" + JsonString(phase) +
+                                      (retry.HasValue ? ",\"suggestedRetrySeconds\":" + retry.Value : "") +
+                                      ",\"sessionGeneration\":" + GetSessionGeneration() +
+                                      ",\"compileEpoch\":" + GetCompileEpoch() + "}");
+                    }
                     case "console.get":
                         return Ok(id, SerializeLogs());
                     case "console.clear":
@@ -217,16 +421,20 @@ namespace UnityComdr.UnityEditor
                     {
                         var msg = ExtractNestedString(line, "message") ?? ExtractString(line, "message") ?? "log";
                         var type = ExtractNestedString(line, "type") ?? "Log";
-                        lock (Gate) Logs.Add(new LogEntry { Type = type, Message = msg });
+                        lock (Gate) Logs.Add(new LogEntry { Type = type, Message = msg, Epoch = GetCompileEpoch() });
                         return Ok(id, "null");
                     }
                     case "editor.getState":
                         return Ok(id, SerializeState());
                     case "editor.compile":
                         AssetDatabase.Refresh();
-                        return Ok(id, "null");
+                        _isCompiling = true;
+                        BumpCompileEpoch();
+                        return Ok(id, "{\"compileEpoch\":" + GetCompileEpoch() +
+                                      ",\"sessionGeneration\":" + GetSessionGeneration() + "}");
                     case "editor.setPlayMode":
                     {
+                        _playTransition = true;
                         var playing = line.IndexOf("\"playing\":true", StringComparison.OrdinalIgnoreCase) >= 0
                                       || line.IndexOf("\"playing\": true", StringComparison.OrdinalIgnoreCase) >= 0;
                         var paused = line.IndexOf("\"paused\":true", StringComparison.OrdinalIgnoreCase) >= 0
@@ -602,7 +810,12 @@ namespace UnityComdr.UnityEditor
                             ExtractString(line, "source") ?? "game_view",
                             ExtractString(line, "targetId"),
                             ExtractInt(line, "width") ?? 1280,
-                            ExtractInt(line, "height") ?? 720));
+                            ExtractInt(line, "height") ?? 720,
+                            ExtractInt(line, "maxResolution") ?? 640,
+                            ExtractInt(line, "regionX"),
+                            ExtractInt(line, "regionY"),
+                            ExtractInt(line, "regionWidth"),
+                            ExtractInt(line, "regionHeight")));
                     case "profiler.get":
                         return Ok(id, ProfilerGetJson());
                     case "profiler.setEnabled":
@@ -629,9 +842,53 @@ namespace UnityComdr.UnityEditor
                             return Ok(id, snap);
                         return Ok(id, "null");
                     }
+                    case "ui.query":
+                        // Minimal stub — full UI enumeration is out of Phase V scope.
+                        return Ok(id, "[]");
+                    case "input.simulate":
+                    {
+                        var action = ExtractString(line, "action") ?? "unknown";
+                        var target = ExtractString(line, "target");
+                        return Ok(id, "{\"ok\":true,\"action\":" + JsonString(action) +
+                                      ",\"target\":" + (target == null ? "null" : JsonString(target)) +
+                                      ",\"note\":" + JsonString("live input simulate acknowledged") +
+                                      ",\"effects\":{}}");
+                    }
+                    case "lease.get":
+                        return Ok(id, SerializeLease());
+                    case "lease.acquire":
+                    {
+                        var agentId = ExtractString(line, "agentId") ?? "";
+                        var ttl = ExtractInt(line, "ttlSeconds") ?? 60;
+                        if (string.IsNullOrEmpty(agentId))
+                            return Fail(id, "agentId required");
+                        PurgeLeaseIfExpired();
+                        if (!string.IsNullOrEmpty(_leaseHolder) &&
+                            !string.Equals(_leaseHolder, agentId, StringComparison.OrdinalIgnoreCase))
+                            return Fail(id, "busy holder=" + _leaseHolder);
+                        _leaseHolder = agentId;
+                        _leaseExpiresUtc = DateTime.UtcNow.AddSeconds(Math.Max(1, ttl));
+                        return Ok(id, SerializeLease());
+                    }
+                    case "lease.release":
+                    {
+                        var agentId = ExtractString(line, "agentId") ?? "";
+                        PurgeLeaseIfExpired();
+                        if (string.IsNullOrEmpty(_leaseHolder))
+                            return Fail(id, "no lease held");
+                        if (!string.Equals(_leaseHolder, agentId, StringComparison.OrdinalIgnoreCase))
+                            return Fail(id, "not_holder holder=" + _leaseHolder);
+                        _leaseHolder = null;
+                        _leaseExpiresUtc = default(DateTime);
+                        return Ok(id, "true");
+                    }
                     default:
                         return Fail(id, "Unknown method: " + method);
                 }
+            }
+            catch (StaleReferenceException ex)
+            {
+                return Fail(id, ex.Message);
             }
             catch (Exception ex)
             {
@@ -641,6 +898,16 @@ namespace UnityComdr.UnityEditor
 
         // --- helpers ---
 
+        private sealed class StaleReferenceException : Exception
+        {
+            public StaleReferenceException(string message) : base(message) { }
+        }
+
+        private static string FormatStaleReference(string idOrPath) =>
+            "stale_reference: GameObject id '" + idOrPath +
+            "' is invalid after domain reload (sessionGeneration=" + GetSessionGeneration() +
+            "). Re-find by hierarchy path, then retry with the new id.";
+
         private static GameObject FindGo(string idOrPath)
         {
             if (string.IsNullOrEmpty(idOrPath)) return null;
@@ -648,6 +915,8 @@ namespace UnityComdr.UnityEditor
             {
                 var obj = EditorUtility.InstanceIDToObject(instanceId) as GameObject;
                 if (obj != null) return obj;
+                // Numeric instance id that no longer resolves — accuracy accident if we fall through to name search.
+                throw new StaleReferenceException(FormatStaleReference(idOrPath));
             }
             var byName = GameObject.Find(idOrPath);
             if (byName != null) return byName;
@@ -1118,77 +1387,620 @@ namespace UnityComdr.UnityEditor
                 + "}";
         }
 
-        private static string CaptureScreenshotJson(string source, string targetId, int width, int height)
+        // Ivan screenshot-isolated: transient user layer for culling (restored in finally).
+        private const int IsolationLayer = 31;
+
+        /// <summary>
+        /// Coplay-inspired capture semantics (algorithm port from ScreenshotUtility / EditorWindowScreenshotUtility):
+        /// - game_view without target → ScreenCapture composited path (Overlay UI included)
+        /// - camera / explicit target → camera.Render (overlay UI excluded)
+        /// - isolated → Ivan-style temp layer + staging camera looking only at target GO (+children)
+        /// - scene_view → SceneView GrabPixels (or explicit error)
+        /// - whole-frame longest-edge downscale (default 640); region crops stay native resolution
+        /// Throws on failure — never returns a fake success marker.
+        /// </summary>
+        private static string CaptureScreenshotJson(
+            string source,
+            string targetId,
+            int width,
+            int height,
+            int maxResolution,
+            int? regionX,
+            int? regionY,
+            int? regionWidth,
+            int? regionHeight)
         {
             width = Math.Max(16, Math.Min(width, 4096));
             height = Math.Max(16, Math.Min(height, 4096));
-            string marker;
+            if (maxResolution <= 0) maxResolution = 640;
+            bool hasRegion = regionX.HasValue && regionY.HasValue && regionWidth.HasValue && regionHeight.HasValue
+                             && regionWidth.Value > 0 && regionHeight.Value > 0;
+            string src = (source ?? "game_view").Trim().ToLowerInvariant();
+            bool hasExplicitTarget = !string.IsNullOrEmpty(targetId);
+
+            Texture2D tex = null;
+            Texture2D working = null;
+            Texture2D downscaled = null;
+            bool? overlayUiIncluded = null;
             string note;
-            string format = "png-base64";
+
             try
             {
-                Camera cam = null;
-                if (!string.IsNullOrEmpty(targetId))
+                if (src == "scene_view")
                 {
-                    var go = FindGo(targetId);
-                    if (go != null) cam = go.GetComponent<Camera>();
+                    tex = CaptureSceneViewTexture();
+                    overlayUiIncluded = false;
+                    note = "Scene View viewport grab (GrabPixels). Overlay game UI not included.";
                 }
-                if (cam == null) cam = Camera.main;
-                if (cam == null) cam = UnityEngine.Object.FindObjectOfType<Camera>();
-
-                if (cam != null && (source == "camera" || source == "game_view" || source == "isolated"))
+                else if (src == "game_view" && !hasExplicitTarget)
                 {
-                    var rt = new RenderTexture(width, height, 24);
-                    var prev = cam.targetTexture;
-                    cam.targetTexture = rt;
-                    cam.Render();
-                    RenderTexture.active = rt;
-                    var tex = new Texture2D(width, height, TextureFormat.RGB24, false);
-                    tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
-                    tex.Apply();
-                    cam.targetTexture = prev;
-                    RenderTexture.active = null;
-                    var bytes = tex.EncodeToPNG();
-                    UnityEngine.Object.DestroyImmediate(tex);
-                    rt.Release();
-                    var b64 = Convert.ToBase64String(bytes);
-                    // Also write full PNG to disk so large payloads are recoverable without truncating base64.
-                    var projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? ".";
-                    var outDir = Path.Combine(projectRoot, "Temp");
-                    Directory.CreateDirectory(outDir);
-                    var fileName = "unity-comdr-shot-" + Guid.NewGuid().ToString("N") + ".png";
-                    var filePath = Path.Combine(outDir, fileName).Replace('\\', '/');
-                    File.WriteAllBytes(filePath, bytes);
-                    marker = "live-png:" + source + ":" + Guid.NewGuid().ToString("N");
-                    note = "Live camera PNG full base64 + filePath length=" + b64.Length;
-                    return "{\"source\":" + JsonString(source) + ",\"format\":" + JsonString(format) +
-                           ",\"note\":" + JsonString(note) + ",\"payloadMarker\":" + JsonString(marker) +
-                           ",\"width\":" + width + ",\"height\":" + height +
-                           ",\"filePath\":" + JsonString(filePath) +
-                           ",\"pngBase64\":" + JsonString(b64) + "}";
+                    // Composited path — includes Screen Space Overlay UI (Coplay CaptureComposited).
+                    tex = CaptureCompositedTexture(1);
+                    if (tex == null)
+                    {
+                        var fallback = FindAvailableCamera(null);
+                        if (fallback == null)
+                            throw new InvalidOperationException(
+                                "game_view capture failed: ScreenCapture returned null and no Camera is available. " +
+                                "Add a Camera to the scene or open Game View with a rendered frame.");
+                        tex = RenderCameraToTexture(fallback, width, height);
+                        overlayUiIncluded = false;
+                        note = "game_view fell back to camera.Render (ScreenCapture unavailable); Overlay UI excluded.";
+                    }
+                    else
+                    {
+                        overlayUiIncluded = true;
+                        note = "game_view composited via ScreenCapture.CaptureScreenshotAsTexture; Overlay UI included.";
+                    }
+                }
+                else if (src == "isolated")
+                {
+                    if (!hasExplicitTarget)
+                        throw new InvalidOperationException(
+                            "source=isolated requires targetId (GameObject instance id, name, or hierarchy path).");
+                    tex = CaptureIsolatedObjectTexture(targetId, width, height, out note);
+                    overlayUiIncluded = false;
+                }
+                else if (src == "camera" || src == "game_view")
+                {
+                    var cam = FindAvailableCamera(targetId);
+                    if (cam == null)
+                        throw new InvalidOperationException(
+                            "No Camera available for source=" + src +
+                            (hasExplicitTarget ? (" target=" + targetId) : "") +
+                            ". Add a Camera or pass target=<cameraGameObjectId>.");
+                    tex = RenderCameraToTexture(cam, width, height);
+                    overlayUiIncluded = false;
+                    note = "camera.Render path; Screen Space – Overlay UI excluded.";
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        "Unknown screenshot source '" + source + "'. Use camera|game_view|scene_view|isolated.");
                 }
 
-                marker = "live-marker:" + source + ":" + Guid.NewGuid().ToString("N");
-                note = "No camera available; returned non-empty live marker (scene_view/game_view without camera).";
-                return "{\"source\":" + JsonString(source) + ",\"format\":\"marker\",\"note\":" + JsonString(note) +
-                       ",\"payloadMarker\":" + JsonString(marker) + ",\"width\":" + width + ",\"height\":" + height + "}";
+                if (tex == null)
+                    throw new InvalidOperationException("Screenshot capture produced no texture.");
+
+                working = tex;
+                tex = null;
+
+                if (hasRegion)
+                {
+                    // AC-V9: region crops stay at native resolution — never apply 640 downscale.
+                    working = CropTextureTopLeft(working, regionX.Value, regionY.Value, regionWidth.Value, regionHeight.Value, destroySource: true);
+                    note += " Region crop at native resolution.";
+                }
+                else
+                {
+                    // Whole-frame: longest-edge downscale (Coplay DownscaleTexture, default 640).
+                    if (working.width > maxResolution || working.height > maxResolution)
+                    {
+                        downscaled = DownscaleTexture(working, maxResolution);
+                        UnityEngine.Object.DestroyImmediate(working);
+                        working = downscaled;
+                        downscaled = null;
+                        note += " Downscaled to maxResolution=" + maxResolution + ".";
+                    }
+                }
+
+                byte[] png = working.EncodeToPNG();
+                int outW = working.width;
+                int outH = working.height;
+                string b64 = Convert.ToBase64String(png);
+
+                var projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? ".";
+                var outDir = Path.Combine(projectRoot, "Temp");
+                Directory.CreateDirectory(outDir);
+                var filePath = Path.Combine(outDir, "unity-comdr-shot-" + Guid.NewGuid().ToString("N") + ".png")
+                    .Replace('\\', '/');
+                File.WriteAllBytes(filePath, png);
+
+                return "{"
+                    + "\"source\":" + JsonString(src) + ","
+                    + "\"format\":\"png\","
+                    + "\"note\":" + JsonString(note) + ","
+                    + "\"width\":" + outW + ","
+                    + "\"height\":" + outH + ","
+                    + "\"filePath\":" + JsonString(filePath) + ","
+                    + "\"pngBase64\":" + JsonString(b64) + ","
+                    + "\"isRealPixels\":true,"
+                    + "\"overlayUiIncluded\":" + (overlayUiIncluded == null ? "null" : (overlayUiIncluded.Value ? "true" : "false"))
+                    + (hasExplicitTarget ? ",\"targetId\":" + JsonString(targetId) : "")
+                    + "}";
+            }
+            finally
+            {
+                if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
+                if (working != null) UnityEngine.Object.DestroyImmediate(working);
+                if (downscaled != null) UnityEngine.Object.DestroyImmediate(downscaled);
+            }
+        }
+
+        private static Camera FindAvailableCamera(string targetId)
+        {
+            if (!string.IsNullOrEmpty(targetId))
+            {
+                var go = FindGo(targetId);
+                if (go != null)
+                {
+                    var c = go.GetComponent<Camera>();
+                    if (c != null) return c;
+                }
+            }
+            if (Camera.main != null) return Camera.main;
+            return UnityEngine.Object.FindObjectOfType<Camera>();
+        }
+
+        /// <summary>
+        /// Ivan-style isolated capture (algorithm port from Screenshot.Isolated):
+        /// temporarily assign target (+children) to IsolationLayer, stage a temp camera+light
+        /// that culls only that layer, Render once, restore layers/activeSelf, destroy temps.
+        /// </summary>
+        private static Texture2D CaptureIsolatedObjectTexture(string targetId, int width, int height, out string note)
+        {
+            note = null;
+            var target = FindGo(targetId);
+            if (target == null)
+                throw new InvalidOperationException(
+                    "isolated capture failed: GameObject not found for targetId='" + targetId + "'.");
+
+            var renderers = new List<Renderer>();
+            target.GetComponentsInChildren(true, renderers);
+            if (renderers.Count == 0)
+                throw new InvalidOperationException(
+                    "isolated capture failed: no Renderer on target or children ('" + target.name + "').");
+
+            var bounds = ComputeRendererBounds(renderers);
+            var targets = CollectIsolationGameObjects(target);
+            var originalLayers = new Dictionary<GameObject, int>(targets.Count);
+            var originalActiveSelf = new Dictionary<GameObject, bool>(targets.Count);
+            var temporaryObjects = new List<GameObject>(2);
+            RenderTexture rt = null;
+            Texture2D tex = null;
+            var prevActive = RenderTexture.active;
+            var activatedInactive = false;
+
+            try
+            {
+                foreach (var go in targets)
+                {
+                    if (go == null) continue;
+                    originalLayers[go] = go.layer;
+                    originalActiveSelf[go] = go.activeSelf;
+                    if (!go.activeSelf)
+                    {
+                        go.SetActive(true);
+                        activatedInactive = true;
+                    }
+                    go.layer = IsolationLayer;
+                }
+
+                int w = Math.Max(16, width);
+                int h = Math.Max(16, height);
+                rt = RenderTexture.GetTemporary(w, h, 24, RenderTextureFormat.ARGB32);
+
+                var camGo = new GameObject("__UnityComdr_IsolationCamera__")
+                {
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                temporaryObjects.Add(camGo);
+                var cam = camGo.AddComponent<Camera>();
+                cam.clearFlags = CameraClearFlags.SolidColor;
+                cam.backgroundColor = new Color(0.25f, 0.25f, 0.25f, 1f);
+                cam.fieldOfView = 60f;
+                cam.nearClipPlane = 0.01f;
+                cam.farClipPlane = 1000f;
+                cam.cullingMask = 1 << IsolationLayer;
+                cam.allowHDR = false;
+                cam.allowMSAA = false;
+                cam.targetTexture = rt;
+                FrameCameraOnBounds(cam, bounds, padding: 1.2f);
+
+                var lightGo = new GameObject("__UnityComdr_IsolationLight__")
+                {
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                temporaryObjects.Add(lightGo);
+                var light = lightGo.AddComponent<Light>();
+                light.type = LightType.Directional;
+                light.color = Color.white;
+                light.intensity = 1f;
+                light.cullingMask = 1 << IsolationLayer;
+                lightGo.transform.rotation = Quaternion.Euler(50f, -30f, 0f);
+
+                cam.Render();
+                RenderTexture.active = rt;
+                tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+                tex.Apply();
+
+                var result = tex;
+                tex = null;
+
+                note = "Ivan-style isolated: temp layer " + IsolationLayer
+                    + " + staging camera/light culling only target (+children); layers/activeSelf restored after render."
+                    + " Limitations: Screen Space Overlay UI excluded; inactive children briefly SetActive(true)"
+                    + " so OnEnable side effects (audio/network/animation) are not rewindable; no composite multi-view"
+                    + " or custom lights JSON in this port; layer " + IsolationLayer
+                    + " is borrowed only for the capture window — do not rely on it remaining assigned."
+                    + (activatedInactive ? " Some inactive children were temporarily activated." : "");
+                return result;
+            }
+            finally
+            {
+                RenderTexture.active = prevActive;
+                if (rt != null) RenderTexture.ReleaseTemporary(rt);
+                if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
+                foreach (var go in temporaryObjects)
+                {
+                    if (go != null) UnityEngine.Object.DestroyImmediate(go);
+                }
+                foreach (var kvp in originalLayers)
+                {
+                    if (kvp.Key != null) kvp.Key.layer = kvp.Value;
+                }
+                foreach (var kvp in originalActiveSelf)
+                {
+                    if (kvp.Key != null && kvp.Key.activeSelf != kvp.Value)
+                        kvp.Key.SetActive(kvp.Value);
+                }
+            }
+        }
+
+        private static List<GameObject> CollectIsolationGameObjects(GameObject target)
+        {
+            var list = new List<GameObject> { target };
+            var transforms = target.GetComponentsInChildren<Transform>(true);
+            for (var i = 0; i < transforms.Length; i++)
+            {
+                var go = transforms[i] != null ? transforms[i].gameObject : null;
+                if (go != null && go != target)
+                    list.Add(go);
+            }
+            return list;
+        }
+
+        private static Bounds ComputeRendererBounds(List<Renderer> renderers)
+        {
+            var initialised = false;
+            var bounds = new Bounds();
+            for (var i = 0; i < renderers.Count; i++)
+            {
+                var r = renderers[i];
+                if (r == null) continue;
+                if (!initialised)
+                {
+                    bounds = r.bounds;
+                    initialised = true;
+                }
+                else
+                {
+                    bounds.Encapsulate(r.bounds);
+                }
+            }
+            if (!initialised || bounds.size == Vector3.zero)
+                bounds = new Bounds(bounds.center, Vector3.one * 0.1f);
+            return bounds;
+        }
+
+        private static void FrameCameraOnBounds(Camera cam, Bounds bounds, float padding)
+        {
+            var radius = bounds.extents.magnitude;
+            if (radius < 0.0001f) radius = 0.05f;
+            var fovRad = cam.fieldOfView * 0.5f * Mathf.Deg2Rad;
+            var distance = (radius * padding) / Mathf.Sin(fovRad);
+            // Front view: camera looks along -Z toward bounds center (Ivan CameraView.Front).
+            cam.transform.position = bounds.center + new Vector3(0f, 0f, -1f) * distance;
+            cam.transform.LookAt(bounds.center, Vector3.up);
+            cam.nearClipPlane = Mathf.Min(cam.nearClipPlane, Mathf.Max(0.01f, distance * 0.01f));
+            cam.farClipPlane = Mathf.Max(cam.farClipPlane, distance + radius * 4f);
+        }
+
+        private static Texture2D RenderCameraToTexture(Camera camera, int width, int height)
+        {
+            int w = Math.Max(1, camera.pixelWidth > 0 ? camera.pixelWidth : width);
+            int h = Math.Max(1, camera.pixelHeight > 0 ? camera.pixelHeight : height);
+            var rt = RenderTexture.GetTemporary(w, h, 24, RenderTextureFormat.ARGB32);
+            var prevRt = camera.targetTexture;
+            var prevActive = RenderTexture.active;
+            Texture2D tex = null;
+            try
+            {
+                camera.targetTexture = rt;
+                camera.Render();
+                RenderTexture.active = rt;
+                tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+                tex.Apply();
+                var result = tex;
+                tex = null;
+                return result;
+            }
+            finally
+            {
+                camera.targetTexture = prevRt;
+                RenderTexture.active = prevActive;
+                RenderTexture.ReleaseTemporary(rt);
+                if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
+            }
+        }
+
+        /// <summary>
+        /// Port of Coplay ScreenshotUtility.CaptureComposited (+ WaitForEndOfFrame in play mode).
+        /// </summary>
+        private static Texture2D CaptureCompositedTexture(int superSize)
+        {
+            superSize = Math.Max(1, superSize);
+            try
+            {
+                if (Application.isPlaying)
+                {
+                    var afterFrame = CaptureCompositedAfterFrame(superSize);
+                    if (afterFrame != null) return afterFrame;
+                }
+                return ScreenCapture.CaptureScreenshotAsTexture(superSize);
             }
             catch (Exception ex)
             {
-                marker = "live-error:" + Guid.NewGuid().ToString("N");
-                return "{\"source\":" + JsonString(source) + ",\"format\":\"marker\",\"note\":" + JsonString(ex.Message) +
-                       ",\"payloadMarker\":" + JsonString(marker) + ",\"width\":" + width + ",\"height\":" + height + "}";
+                Debug.LogWarning("[Unity-Comdr] CaptureScreenshotAsTexture failed: " + ex.Message);
+                return null;
             }
+        }
+
+        private static Texture2D CaptureCompositedAfterFrame(int superSize, int timeoutSteps = 5)
+        {
+            Texture2D result = null;
+            bool done = false;
+            bool callerReturned = false;
+            var go = new GameObject("__UnityComdr_ScreenshotCapturer__") { hideFlags = HideFlags.HideAndDontSave };
+            var capturer = go.AddComponent<ScreenshotFrameCapturer>();
+            capturer.Begin(superSize, tex =>
+            {
+                if (callerReturned)
+                {
+                    if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
+                    return;
+                }
+                result = tex;
+                done = true;
+            });
+            bool wasPaused = EditorApplication.isPaused;
+            try
+            {
+                for (int i = 0; i < timeoutSteps && !done; i++)
+                    EditorApplication.Step();
+            }
+            finally
+            {
+                if (!wasPaused)
+                    EditorApplication.isPaused = false;
+            }
+            callerReturned = true;
+            if (!done && go != null)
+                UnityEngine.Object.DestroyImmediate(go);
+            return result;
+        }
+
+        /// <summary>
+        /// Scene View viewport grab via internal GUIView.GrabPixels (Coplay EditorWindowScreenshotUtility idea).
+        /// </summary>
+        private static Texture2D CaptureSceneViewTexture()
+        {
+            var sceneView = SceneView.lastActiveSceneView;
+            if (sceneView == null)
+                throw new InvalidOperationException(
+                    "scene_view capture failed: no active Scene View. Focus a Scene View window and retry.");
+
+            try { sceneView.Focus(); } catch { /* best effort */ }
+            try
+            {
+                sceneView.Repaint();
+                SceneView.RepaintAll();
+                System.Threading.Thread.Sleep(75);
+            }
+            catch { /* best effort */ }
+
+            var hostField = typeof(EditorWindow).GetField("m_Parent",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var hostView = hostField?.GetValue(sceneView);
+            if (hostView == null)
+                throw new InvalidOperationException(
+                    "scene_view capture failed: could not resolve Scene View host view (GrabPixels unavailable).");
+
+            var grab = hostView.GetType().GetMethod(
+                "GrabPixels",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic,
+                null,
+                new[] { typeof(RenderTexture), typeof(Rect) },
+                null);
+            if (grab == null)
+                throw new InvalidOperationException(
+                    "scene_view capture failed: GUIView.GrabPixels not found on this Unity version.");
+
+            Camera cam = sceneView.camera;
+            int width = cam != null && cam.pixelWidth > 0 ? cam.pixelWidth : 640;
+            int height = cam != null && cam.pixelHeight > 0 ? cam.pixelHeight : 360;
+            if (width <= 0 || height <= 0)
+                throw new InvalidOperationException("scene_view capture failed: empty viewport.");
+
+            var viewport = new Rect(0, 0, width, height);
+            RenderTexture rt = null;
+            var prevActive = RenderTexture.active;
+            try
+            {
+                rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32)
+                {
+                    antiAliasing = 1,
+                    filterMode = FilterMode.Bilinear,
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                rt.Create();
+                grab.Invoke(hostView, new object[] { rt, viewport });
+                RenderTexture.active = rt;
+                var tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
+                tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                tex.Apply();
+                FlipTextureVertically(tex);
+                return tex;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    "scene_view capture failed: " + (ex.InnerException ?? ex).Message, ex);
+            }
+            finally
+            {
+                RenderTexture.active = prevActive;
+                if (rt != null)
+                {
+                    rt.Release();
+                    UnityEngine.Object.DestroyImmediate(rt);
+                }
+            }
+        }
+
+        private static void FlipTextureVertically(Texture2D tex)
+        {
+            var pixels = tex.GetPixels32();
+            int w = tex.width;
+            int h = tex.height;
+            var flipped = new Color32[pixels.Length];
+            for (int y = 0; y < h; y++)
+                Array.Copy(pixels, y * w, flipped, (h - 1 - y) * w, w);
+            tex.SetPixels32(flipped);
+            tex.Apply();
+        }
+
+        /// <summary>Port of Coplay ScreenshotUtility.DownscaleTexture (bilinear blit, never upscale).</summary>
+        private static Texture2D DownscaleTexture(Texture2D source, int maxEdge)
+        {
+            if (source == null) throw new ArgumentNullException("source");
+            if (maxEdge <= 0) throw new ArgumentOutOfRangeException("maxEdge");
+
+            int srcW = source.width;
+            int srcH = source.height;
+            float scale = Mathf.Min((float)maxEdge / srcW, (float)maxEdge / srcH);
+            scale = Mathf.Min(scale, 1f);
+            int dstW = Mathf.Max(1, Mathf.RoundToInt(srcW * scale));
+            int dstH = Mathf.Max(1, Mathf.RoundToInt(srcH * scale));
+
+            var prevActive = RenderTexture.active;
+            var rt = RenderTexture.GetTemporary(dstW, dstH, 0, RenderTextureFormat.ARGB32);
+            rt.filterMode = FilterMode.Bilinear;
+            try
+            {
+                Graphics.Blit(source, rt);
+                RenderTexture.active = rt;
+                var dst = new Texture2D(dstW, dstH, TextureFormat.RGBA32, false);
+                dst.ReadPixels(new Rect(0, 0, dstW, dstH), 0, 0);
+                dst.Apply();
+                return dst;
+            }
+            finally
+            {
+                RenderTexture.active = prevActive;
+                RenderTexture.ReleaseTemporary(rt);
+            }
+        }
+
+        /// <summary>Crop with top-left origin (agent-friendly); converts to Unity bottom-left.</summary>
+        private static Texture2D CropTextureTopLeft(Texture2D source, int x, int y, int w, int h, bool destroySource)
+        {
+            x = Mathf.Clamp(x, 0, Math.Max(0, source.width - 1));
+            y = Mathf.Clamp(y, 0, Math.Max(0, source.height - 1));
+            w = Mathf.Clamp(w, 1, source.width - x);
+            h = Mathf.Clamp(h, 1, source.height - y);
+            int unityY = source.height - y - h;
+            if (unityY < 0) unityY = 0;
+            if (unityY + h > source.height) h = source.height - unityY;
+
+            var pixels = source.GetPixels(x, unityY, w, h);
+            var cropped = new Texture2D(w, h, TextureFormat.RGBA32, false);
+            cropped.SetPixels(pixels);
+            cropped.Apply();
+            if (destroySource) UnityEngine.Object.DestroyImmediate(source);
+            return cropped;
+        }
+
+        /// <summary>Play-mode WaitForEndOfFrame helper (Coplay ScreenshotCapturer pattern).</summary>
+        private sealed class ScreenshotFrameCapturer : MonoBehaviour
+        {
+            private int _superSize = 1;
+            private Action<Texture2D> _onComplete;
+
+            public void Begin(int superSize, Action<Texture2D> onComplete)
+            {
+                _superSize = Math.Max(1, superSize);
+                _onComplete = onComplete;
+                StartCoroutine(CaptureRoutine());
+            }
+
+            private System.Collections.IEnumerator CaptureRoutine()
+            {
+                yield return new WaitForEndOfFrame();
+                Texture2D tex = null;
+                try { tex = ScreenCapture.CaptureScreenshotAsTexture(_superSize); }
+                catch (Exception ex) { Debug.LogError("[Unity-Comdr] CaptureScreenshotAsTexture failed: " + ex.Message); }
+                _onComplete?.Invoke(tex);
+                Destroy(gameObject);
+            }
+        }
+
+        private static void PurgeLeaseIfExpired()
+        {
+            if (!string.IsNullOrEmpty(_leaseHolder) && DateTime.UtcNow >= _leaseExpiresUtc)
+            {
+                _leaseHolder = null;
+                _leaseExpiresUtc = default(DateTime);
+            }
+        }
+
+        private static string SerializeLease()
+        {
+            PurgeLeaseIfExpired();
+            if (string.IsNullOrEmpty(_leaseHolder))
+                return "{\"holder\":null,\"expiresAt\":null,\"held\":false}";
+            return "{\"holder\":" + JsonString(_leaseHolder) +
+                   ",\"expiresAt\":" + JsonString(_leaseExpiresUtc.ToString("o")) +
+                   ",\"held\":true}";
         }
 
         private static string SerializeState()
         {
             var scene = SceneManager.GetActiveScene();
+            _isCompiling = EditorApplication.isCompiling;
+            var phase = CurrentPhase();
+            var retry = SuggestedRetryForPhase(phase);
             return "{"
-                + "\"isCompiling\":" + (EditorApplication.isCompiling ? "true" : "false") + ","
+                + "\"phase\":" + JsonString(phase) + ","
+                + (retry.HasValue ? "\"suggestedRetrySeconds\":" + retry.Value + "," : "")
+                + "\"isCompiling\":" + (_isCompiling ? "true" : "false") + ","
                 + "\"isPlaying\":" + (EditorApplication.isPlaying ? "true" : "false") + ","
                 + "\"isPaused\":" + (EditorApplication.isPaused ? "true" : "false") + ","
-                + "\"activeScenePath\":" + JsonString(scene.path ?? "")
+                + "\"activeScenePath\":" + JsonString(scene.path ?? "") + ","
+                + "\"compileEpoch\":" + GetCompileEpoch() + ","
+                + "\"sessionGeneration\":" + GetSessionGeneration()
                 + "}";
         }
 
@@ -1196,10 +2008,16 @@ namespace UnityComdr.UnityEditor
         {
             lock (Gate)
             {
+                var epoch = GetCompileEpoch();
                 var parts = new List<string>();
                 foreach (var l in Logs)
                 {
-                    parts.Add("{\"type\":" + JsonString(l.Type) + ",\"message\":" + JsonString(l.Message) + ",\"file\":null,\"line\":0}");
+                    var stale = l.Epoch < epoch ? "true" : "false";
+                    parts.Add("{\"type\":" + JsonString(l.Type) +
+                              ",\"message\":" + JsonString(l.Message) +
+                              ",\"file\":null,\"line\":0" +
+                              ",\"epoch\":" + l.Epoch +
+                              ",\"stale\":" + stale + "}");
                 }
                 return "[" + string.Join(",", parts) + "]";
             }
@@ -1347,6 +2165,7 @@ namespace UnityComdr.UnityEditor
             public string StackTrace;
             public string File;
             public int Line;
+            public int Epoch;
         }
     }
 }

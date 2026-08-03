@@ -36,7 +36,9 @@ public static class CoreTools
                     type = l.Type.ToString(),
                     message = l.Message,
                     file = l.File,
-                    line = l.Line
+                    line = l.Line,
+                    epoch = l.Epoch,
+                    stale = l.Stale
                 });
                 return await Task.FromResult(ToolResult.OkJson(page));
             }));
@@ -78,21 +80,31 @@ public static class CoreTools
                 var path = RequireString(args, "path");
                 var content = RequireString(args, "content");
                 editor.WriteScript(path, content);
-                return await Task.FromResult(ToolResult.OkJson(new { ok = true, path = NormalizeScriptPath(path) }));
+                var normalized = NormalizeScriptPath(path);
+                var written = editor.ReadScript(normalized) ?? content;
+                return await Task.FromResult(ToolResult.OkJson(new { path = normalized, length = written.Length }));
             }));
 
         registry.RegisterCore(Make(
             "script_delete",
-            "Delete a C# script asset.",
+            "Delete a C# script asset. Pass dryRun=true to preview impact without deleting.",
             JsonSchemaHelper.Object(
-                ("path", JsonSchemaHelper.String("Script path"), true)
+                ("path", JsonSchemaHelper.String("Script path"), true),
+                ("dryRun", JsonSchemaHelper.Boolean("Preview impact without mutating (default false)"), false)
             ),
             async (args, _) =>
             {
                 var path = RequireString(args, "path");
+                var dryRun = GetBool(args, "dryRun") ?? false;
+                var existing = editor.ReadScript(path);
+                if (existing == null)
+                    return ToolResult.Error($"Script not found: {path}");
+                var impact = new[] { new { path = NormalizeScriptPath(path), length = existing.Length } };
+                if (dryRun)
+                    return await Task.FromResult(ToolResult.OkJson(new { dryRun = true, wouldDelete = impact }));
                 var ok = editor.DeleteScript(path);
                 return await Task.FromResult(ok
-                    ? ToolResult.Ok($"Deleted {path}")
+                    ? ToolResult.OkJson(new { deleted = true, removed = impact })
                     : ToolResult.Error($"Script not found: {path}"));
             }));
 
@@ -113,23 +125,27 @@ public static class CoreTools
 
         registry.RegisterCore(Make(
             "editor_state",
-            "Get compile / play mode / active scene state.",
+            "Get Editor lifecycle + compile/play/scene state. phase is connected|editor_compiling|editor_reloading|play_transition|editor_gone. compileEpoch marks console log generations; sessionGeneration invalidates prior GameObject instance ids after domain reload. When busy, wait suggestedRetrySeconds and retry — never treat hang/timeout as success.",
             JsonSchemaHelper.Object(),
             async (_, _) =>
             {
                 var s = editor.GetState();
                 return await Task.FromResult(ToolResult.OkJson(new
                 {
+                    phase = s.Phase,
+                    suggestedRetrySeconds = s.SuggestedRetrySeconds,
                     isCompiling = s.IsCompiling,
                     isPlaying = s.IsPlaying,
                     isPaused = s.IsPaused,
-                    activeScenePath = s.ActiveScenePath
+                    activeScenePath = s.ActiveScenePath,
+                    compileEpoch = s.CompileEpoch,
+                    sessionGeneration = s.SessionGeneration
                 }));
             }));
 
         registry.RegisterCore(Make(
             "editor_compile",
-            "Request script recompile and return updated editor state.",
+            "Request script recompile; returns incremented compileEpoch. Console entries from older epochs are marked stale:true on console_read.",
             JsonSchemaHelper.Object(),
             async (_, _) =>
             {
@@ -138,6 +154,7 @@ public static class CoreTools
                 return await Task.FromResult(ToolResult.OkJson(new
                 {
                     ok = true,
+                    compileEpoch = s.CompileEpoch,
                     isCompiling = s.IsCompiling,
                     message = "Compile requested."
                 }));
@@ -223,7 +240,7 @@ public static class CoreTools
 
         registry.RegisterCore(Make(
             "gameobject_manage",
-            "GameObject ops (IvanMurzak/Coplay parity): create|get|find|delete|duplicate|rename|set_active|set_parent|set_transform|set_tag|set_layer.",
+            "GameObject ops (IvanMurzak/Coplay parity): create|get|find|delete|duplicate|rename|set_active|set_parent|set_transform|set_tag|set_layer. Mutations return post-state summary. delete supports dryRun.",
             JsonSchemaHelper.Object(
                 ("action", JsonSchemaHelper.String(null, new[]
                 {
@@ -238,6 +255,7 @@ public static class CoreTools
                 ("layer", JsonSchemaHelper.Integer("Unity layer index"), false),
                 ("componentType", JsonSchemaHelper.String("Filter find by component type"), false),
                 ("active", JsonSchemaHelper.Boolean(), false),
+                ("dryRun", JsonSchemaHelper.Boolean("For delete: preview impact without mutating"), false),
                 ("position", JsonSchemaHelper.ObjectOpen("x,y,z — partial axes allowed"), false),
                 ("rotation", JsonSchemaHelper.ObjectOpen("x,y,z euler — partial axes allowed"), false),
                 ("scale", JsonSchemaHelper.ObjectOpen("x,y,z — partial axes allowed"), false)
@@ -256,14 +274,14 @@ public static class CoreTools
                         var layer = GetInt(args, "layer");
                         if (layer.HasValue) editor.SetLayer(go.Id, layer.Value);
                         go = editor.FindGameObject(go.Id)!;
-                        return ToolResult.OkJson(SummarizeGo(go));
+                        return ToolResult.OkJson(MutationEcho(go));
                     }
                     case "get":
                     {
                         var target = RequireString(args, "target");
                         var go = editor.FindGameObject(target);
                         return go == null
-                            ? ToolResult.Error($"Not found: {target}")
+                            ? NotFoundGo(editor, target)
                             : ToolResult.OkJson(DetailGo(go));
                     }
                     case "find":
@@ -274,69 +292,83 @@ public static class CoreTools
                     case "delete":
                     {
                         var target = RequireString(args, "target");
-                        return editor.DeleteGameObject(target)
-                            ? ToolResult.Ok($"Deleted {target}")
-                            : ToolResult.Error($"Not found: {target}");
+                        var dryRun = GetBool(args, "dryRun") ?? false;
+                        var existing = editor.FindGameObject(target);
+                        if (existing == null)
+                            return NotFoundGo(editor, target);
+                        var impact = CollectGoSubtree(editor, existing);
+                        if (dryRun)
+                            return ToolResult.OkJson(new { dryRun = true, wouldDelete = impact });
+                        editor.DeleteGameObject(target);
+                        return ToolResult.OkJson(new { deleted = true, removed = impact });
                     }
                     case "duplicate":
                     {
                         var target = RequireString(args, "target");
                         var go = editor.DuplicateGameObject(target, GetString(args, "name"));
                         return go == null
-                            ? ToolResult.Error($"Not found: {target}")
-                            : ToolResult.OkJson(SummarizeGo(go));
+                            ? NotFoundGo(editor, target)
+                            : ToolResult.OkJson(MutationEcho(go));
                     }
                     case "rename":
                     {
                         var target = RequireString(args, "target");
                         var name = RequireString(args, "name");
-                        return editor.RenameGameObject(target, name)
-                            ? ToolResult.Ok($"Renamed to {name}")
-                            : ToolResult.Error($"Not found: {target}");
+                        if (!editor.RenameGameObject(target, name))
+                            return NotFoundGo(editor, target);
+                        var go = editor.FindGameObject(target) ?? editor.FindGameObject(name);
+                        return go == null
+                            ? ToolResult.Error($"Renamed but could not re-read: {name}")
+                            : ToolResult.OkJson(MutationEcho(go));
                     }
                     case "set_active":
                     {
                         var target = RequireString(args, "target");
                         var active = GetBool(args, "active") ?? true;
-                        return editor.SetActive(target, active)
-                            ? ToolResult.Ok($"Active={active} for {target}")
-                            : ToolResult.Error($"Not found: {target}");
+                        if (!editor.SetActive(target, active))
+                            return NotFoundGo(editor, target);
+                        return ToolResult.OkJson(MutationEcho(editor.FindGameObject(target)!));
                     }
                     case "set_parent":
                     {
                         var target = RequireString(args, "target");
                         var parent = GetString(args, "parent");
-                        return editor.SetParent(target, parent)
-                            ? ToolResult.Ok($"Parent set for {target}")
-                            : ToolResult.Error($"Failed to set parent for {target}");
+                        if (!editor.SetParent(target, parent))
+                            return ToolResult.ErrorEnvelope(
+                                "set_parent_failed",
+                                $"Failed to set parent for {target}",
+                                suggestion: "Ensure target and parent ids/paths exist and are not the same object.",
+                                nextStep: "Call gameobject_manage action=get on target/parent, then retry.");
+                        return ToolResult.OkJson(MutationEcho(editor.FindGameObject(target)!));
                     }
                     case "set_transform":
                     {
                         var target = RequireString(args, "target");
                         var existing = editor.FindGameObject(target);
                         if (existing == null)
-                            return ToolResult.Error($"Not found: {target}");
+                            return NotFoundGo(editor, target);
                         var pos = MergeVec(existing.Transform.Position, ReadPartialVec(args, "position"));
                         var rot = MergeVec(existing.Transform.RotationEuler, ReadPartialVec(args, "rotation"));
                         var scl = MergeVec(existing.Transform.Scale, ReadPartialVec(args, "scale"));
-                        var ok = editor.SetTransform(target, pos, rot, scl);
-                        return ok ? ToolResult.Ok($"Transform updated for {target}") : ToolResult.Error($"Not found: {target}");
+                        if (!editor.SetTransform(target, pos, rot, scl))
+                            return NotFoundGo(editor, target);
+                        return ToolResult.OkJson(MutationEcho(editor.FindGameObject(target)!));
                     }
                     case "set_tag":
                     {
                         var target = RequireString(args, "target");
                         var tag = RequireString(args, "tag");
-                        return editor.SetTag(target, tag)
-                            ? ToolResult.Ok($"Tag={tag} for {target}")
-                            : ToolResult.Error($"Not found: {target}");
+                        if (!editor.SetTag(target, tag))
+                            return NotFoundGo(editor, target);
+                        return ToolResult.OkJson(MutationEcho(editor.FindGameObject(target)!));
                     }
                     case "set_layer":
                     {
                         var target = RequireString(args, "target");
                         var layer = GetInt(args, "layer") ?? 0;
-                        return editor.SetLayer(target, layer)
-                            ? ToolResult.Ok($"Layer={layer} for {target}")
-                            : ToolResult.Error($"Not found: {target}");
+                        if (!editor.SetLayer(target, layer))
+                            return NotFoundGo(editor, target);
+                        return ToolResult.OkJson(MutationEcho(editor.FindGameObject(target)!));
                     }
                     default:
                         return ToolResult.Error($"Unknown action: {action}");
@@ -367,26 +399,41 @@ public static class CoreTools
                 switch (action)
                 {
                     case "add":
-                        return editor.AddComponent(target, type, props)
-                            ? ToolResult.OkJson(new { ok = true, target, type })
-                            : ToolResult.Error($"Failed to add {type} on {target}");
+                    {
+                        if (!editor.AddComponent(target, type, props))
+                            return ToolResult.Error($"Failed to add {type} on {target}");
+                        var added = editor.GetComponent(target, type);
+                        object snapshot = added == null
+                            ? new { typeName = type, properties = props ?? new Dictionary<string, object?>() }
+                            : ComponentSnapshot(added);
+                        return ToolResult.OkJson(new { target, component = snapshot });
+                    }
                     case "get":
                     {
                         var c = editor.GetComponent(target, type);
                         return c == null
                             ? ToolResult.Error($"Component {type} not found on {target}")
-                            : ToolResult.OkJson(new { c.TypeName, c.Properties });
+                            : ToolResult.OkJson(ComponentSnapshot(c));
                     }
                     case "modify":
+                    {
                         if (props == null || props.Count == 0)
                             return ToolResult.Error("properties required for modify");
-                        return editor.ModifyComponent(target, type, props)
-                            ? ToolResult.Ok($"Modified {type} on {target}")
-                            : ToolResult.Error($"Failed to modify {type} on {target}");
+                        if (!editor.ModifyComponent(target, type, props))
+                            return ToolResult.Error($"Failed to modify {type} on {target}");
+                        var modified = editor.GetComponent(target, type);
+                        object snapshot = modified == null
+                            ? new { typeName = type, properties = props }
+                            : ComponentSnapshot(modified);
+                        return ToolResult.OkJson(new { target, component = snapshot });
+                    }
                     case "remove":
-                        return editor.RemoveComponent(target, type)
-                            ? ToolResult.Ok($"Removed {type} from {target}")
-                            : ToolResult.Error($"Component {type} not found on {target}");
+                    {
+                        var before = editor.GetComponent(target, type);
+                        if (before == null || !editor.RemoveComponent(target, type))
+                            return ToolResult.Error($"Component {type} not found on {target}");
+                        return ToolResult.OkJson(new { removed = true, target, component = ComponentSnapshot(before) });
+                    }
                     default:
                         return ToolResult.Error($"Unknown action: {action}");
                 }
@@ -394,7 +441,7 @@ public static class CoreTools
 
         registry.RegisterCore(Make(
             "assets_manage",
-            "Asset ops (IvanMurzak parity): find|material_create|material_assign|prefab_create|prefab_instantiate|create_folder|delete|copy|move|refresh|list_shaders.",
+            "Asset ops (IvanMurzak parity): find|material_create|material_assign|prefab_create|prefab_instantiate|create_folder|delete|copy|move|refresh|list_shaders. delete supports dryRun.",
             JsonSchemaHelper.Object(
                 ("action", JsonSchemaHelper.String(null, new[]
                 {
@@ -410,6 +457,7 @@ public static class CoreTools
                 ("shader", JsonSchemaHelper.String("Shader name"), false),
                 ("target", JsonSchemaHelper.String("GameObject for assign / prefab source"), false),
                 ("parent", JsonSchemaHelper.String("Parent for instantiate"), false),
+                ("dryRun", JsonSchemaHelper.Boolean("For delete: preview impact without mutating"), false),
                 ("offset", JsonSchemaHelper.Integer(), false),
                 ("pageSize", JsonSchemaHelper.Integer(), false)
             ),
@@ -465,8 +513,19 @@ public static class CoreTools
                     case "delete":
                     {
                         var path = RequireString(args, "path");
+                        var dryRun = GetBool(args, "dryRun") ?? false;
+                        var normalized = path.Replace('\\', '/');
+                        var matches = editor.FindAssets()
+                            .Where(a => a.Path.Equals(normalized, StringComparison.OrdinalIgnoreCase) ||
+                                        a.Path.StartsWith(normalized.TrimEnd('/') + "/", StringComparison.OrdinalIgnoreCase))
+                            .Select(a => (object)new { path = a.Path, kind = a.Kind })
+                            .ToList();
+                        if (matches.Count == 0)
+                            return ToolResult.Error($"Asset not found: {path}");
+                        if (dryRun)
+                            return ToolResult.OkJson(new { dryRun = true, wouldDelete = matches });
                         return editor.DeleteAsset(path)
-                            ? ToolResult.Ok($"Deleted {path}")
+                            ? ToolResult.OkJson(new { deleted = true, removed = matches })
                             : ToolResult.Error($"Asset not found: {path}");
                     }
                     case "copy":
@@ -633,6 +692,24 @@ public static class CoreTools
         components = go.Components.Select(c => c.TypeName).ToList()
     };
 
+    /// <summary>O4 mutation echo: post-state summary agents can trust without a follow-up get.</summary>
+    private static object MutationEcho(GameObjectData go) => new
+    {
+        id = go.Id,
+        name = go.Name,
+        transform = go.Transform,
+        parent = go.ParentId,
+        active = go.Active,
+        tag = go.Tag,
+        layer = go.Layer
+    };
+
+    private static object ComponentSnapshot(ComponentData c) => new
+    {
+        typeName = c.TypeName,
+        properties = c.Properties
+    };
+
     private static object DetailGo(GameObjectData go) => new
     {
         go.Id,
@@ -645,6 +722,45 @@ public static class CoreTools
         components = go.Components.Select(c => new { c.TypeName, c.Properties }),
         go.ChildIds
     };
+
+    private static ToolResult NotFoundGo(IEditorHost editor, string target)
+    {
+        string? nearest = null;
+        try
+        {
+            nearest = NameSuggest.Nearest(target, editor.GetAllGameObjects().Select(g => g.Name));
+        }
+        catch
+        {
+            // Live hosts may fail best-effort enumeration; still return actionable error.
+        }
+
+        var suggestion = nearest != null ? $"Did you mean '{nearest}'?" : null;
+        var nextStep = nearest != null
+            ? $"Retry gameobject_manage with target='{nearest}', or call hierarchy_get / action=find."
+            : "Call hierarchy_get or gameobject_manage action=find to list known objects, then retry.";
+        return ToolResult.ErrorEnvelope(
+            "not_found",
+            $"Not found: {target}",
+            suggestion,
+            nextStep);
+    }
+
+    private static List<object> CollectGoSubtree(IEditorHost editor, GameObjectData root)
+    {
+        var list = new List<object>();
+        void Walk(GameObjectData g)
+        {
+            list.Add(new { id = g.Id, name = g.Name, parent = g.ParentId, active = g.Active });
+            foreach (var childId in g.ChildIds)
+            {
+                var child = editor.FindGameObject(childId);
+                if (child != null) Walk(child);
+            }
+        }
+        Walk(root);
+        return list;
+    }
 
     private static string? GetString(JsonObject? args, string key)
     {

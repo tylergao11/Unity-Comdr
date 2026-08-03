@@ -7,12 +7,16 @@ public enum LogType
     Error
 }
 
+/// <param name="Epoch">Compile epoch when recorded (O1 / FR-A6).</param>
+/// <param name="Stale">True when <paramref name="Epoch"/> is older than the current compile epoch.</param>
 public sealed record ConsoleLogEntry(
     LogType Type,
     string Message,
     string? StackTrace = null,
     string? File = null,
-    int Line = 0);
+    int Line = 0,
+    int Epoch = 0,
+    bool Stale = false);
 
 public sealed record Vector3(float X, float Y, float Z)
 {
@@ -73,6 +77,20 @@ public sealed class EditorState
     public bool IsPlaying { get; set; }
     public bool IsPaused { get; set; }
     public string ActiveScenePath { get; set; } = "Assets/Scenes/Untitled.unity";
+
+    /// <summary>
+    /// Machine-readable lifecycle: connected | editor_compiling | editor_reloading | play_transition | editor_gone.
+    /// </summary>
+    public string Phase { get; set; } = "connected";
+
+    /// <summary>Suggested client retry delay when <see cref="Phase"/> is busy; null when connected.</summary>
+    public int? SuggestedRetrySeconds { get; set; }
+
+    /// <summary>Monotonic compile generation; bumped by <c>editor_compile</c> (O1 / FR-A6).</summary>
+    public int CompileEpoch { get; set; }
+
+    /// <summary>Monotonic domain-reload generation; invalidates prior instance ids (O2 / FR-A5).</summary>
+    public int SessionGeneration { get; set; } = 1;
 }
 
 public sealed class MaterialData

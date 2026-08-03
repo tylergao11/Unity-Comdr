@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json.Nodes;
 using UnityComdr.Editor;
 using UnityComdr.Tools;
@@ -13,6 +14,19 @@ public static class SampleSkills
     public const string TestingSkillId = "testing";
     public const string PrefabAdvancedSkillId = "prefab-advanced";
 
+    private sealed class TestJobState
+    {
+        public required string JobId { get; init; }
+        public required string Status { get; set; }
+        public required string Mode { get; init; }
+        public string? Filter { get; init; }
+        public bool Passed { get; set; }
+        public List<object> Results { get; init; } = new();
+    }
+
+    /// <summary>In-memory test jobs (Coplay RunTests/GetTestJob pattern — mode start + poll).</summary>
+    private static readonly ConcurrentDictionary<string, TestJobState> TestJobs = new(StringComparer.OrdinalIgnoreCase);
+
     public static void RegisterAll(ToolRegistry registry, IEditorHost editor)
     {
         registry.RegisterSkill(BuildTestingSkill(editor));
@@ -26,7 +40,8 @@ public static class SampleSkills
             new()
             {
                 Name = "tests_run",
-                Description = "Run a lightweight EditMode-style test pass against in-memory assertions (headless) or Unity Test Runner (Editor).",
+                Description =
+                    "Start a test job (Coplay run_tests pattern). Returns {jobId, status}. Poll with tests_status. mode: EditMode|PlayMode.",
                 SkillId = TestingSkillId,
                 InputSchema = JsonSchemaHelper.Object(
                     ("filter", JsonSchemaHelper.String("Optional name filter"), false),
@@ -41,7 +56,6 @@ public static class SampleSkills
                         ? f.GetValue<string>()
                         : null;
 
-                    // Headless: synthesize a test report from current project state
                     var scripts = editor.ListScripts();
                     var errors = editor.GetConsoleLogs().Count(l => l.Type == Models.LogType.Error);
                     var passed = errors == 0;
@@ -63,12 +77,57 @@ public static class SampleSkills
                     if (!string.IsNullOrEmpty(filter))
                         results = results.Where(r => r.ToString()!.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();
 
+                    var jobId = Guid.NewGuid().ToString("N")[..12];
+                    // Headless/InMemory completes immediately (live Unity would stay running until Test Runner finishes).
+                    var job = new TestJobState
+                    {
+                        JobId = jobId,
+                        Status = "completed",
+                        Mode = mode ?? "EditMode",
+                        Filter = filter,
+                        Passed = passed,
+                        Results = results
+                    };
+                    TestJobs[jobId] = job;
+
                     return await Task.FromResult(ToolResult.OkJson(new
                     {
-                        mode,
-                        filter,
-                        passed,
-                        results
+                        jobId,
+                        status = job.Status
+                    }));
+                }
+            },
+            new()
+            {
+                Name = "tests_status",
+                Description = "Poll a test job started by tests_run (Coplay get_test_job pattern). Pass jobId.",
+                SkillId = TestingSkillId,
+                InputSchema = JsonSchemaHelper.Object(
+                    ("jobId", JsonSchemaHelper.String("Job id from tests_run"), true)
+                ),
+                Handler = async (args, _) =>
+                {
+                    var jobId = args?["jobId"]?.GetValue<string>();
+                    if (string.IsNullOrWhiteSpace(jobId))
+                        return ToolResult.ErrorEnvelope(
+                            "bad_argument",
+                            "Missing required parameter 'jobId'.",
+                            nextStep: "Pass jobId from the tests_run response.");
+
+                    if (!TestJobs.TryGetValue(jobId!, out var job))
+                        return ToolResult.ErrorEnvelope(
+                            "unknown_job",
+                            $"Unknown jobId: {jobId}",
+                            nextStep: "Call tests_run to start a job, then poll with the returned jobId.");
+
+                    return await Task.FromResult(ToolResult.OkJson(new
+                    {
+                        jobId = job.JobId,
+                        status = job.Status,
+                        mode = job.Mode,
+                        filter = job.Filter,
+                        passed = job.Passed,
+                        results = job.Results
                     }));
                 }
             },
@@ -93,7 +152,7 @@ public static class SampleSkills
         {
             Id = TestingSkillId,
             Name = "Testing",
-            Description = "Test Runner helpers for EditMode/PlayMode-style checks.",
+            Description = "Test Runner helpers for EditMode/PlayMode-style checks (async job + poll).",
             Tools = tools
         };
     }

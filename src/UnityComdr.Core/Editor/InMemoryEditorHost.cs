@@ -28,8 +28,13 @@ public sealed class InMemoryEditorHost : IEditorHost
     private readonly Dictionary<string, UiControlInfo> _uiControls = new(StringComparer.OrdinalIgnoreCase);
     private readonly TaskLeaseManager _lease;
     private readonly List<string> _inputLog = new();
+    private readonly HashSet<string> _staleObjectIds = new(StringComparer.OrdinalIgnoreCase);
     private SceneData _active;
     private int _frame;
+    private string? _forcedPhase;
+    private int _forcedRetrySeconds = 2;
+    private int _compileEpoch;
+    private int _sessionGeneration = 1;
 
     /// <summary>Optional clock injection for lease TTL tests.</summary>
     public InMemoryEditorHost(Func<DateTimeOffset>? clock = null)
@@ -107,23 +112,102 @@ public sealed class InMemoryEditorHost : IEditorHost
         AddComponent(cam.Id, "Camera");
         var light = CreateGameObjectInternal("Directional Light", null);
         AddComponent(light.Id, "Light");
+
+        if (seedUi)
+        {
+            _uiControls["ui-score"] = new UiControlInfo
+            {
+                Id = "ui-score",
+                Name = "ScoreLabel",
+                Path = "Canvas/HUD/ScoreLabel",
+                Kind = "Text",
+                Interactable = false,
+                Rect = new UiRect { X = 16, Y = 16, W = 120, H = 32 }
+            };
+            _uiControls["ui-play"] = new UiControlInfo
+            {
+                Id = "ui-play",
+                Name = "PlayButton",
+                Path = "Canvas/Menu/PlayButton",
+                Kind = "Button",
+                Interactable = true,
+                Rect = new UiRect { X = 200, Y = 300, W = 160, H = 48 }
+            };
+        }
     }
 
     // --- Console ---
 
-    public IReadOnlyList<ConsoleLogEntry> GetConsoleLogs() => _logs.ToList();
+    public IReadOnlyList<ConsoleLogEntry> GetConsoleLogs() =>
+        _logs.Select(l => l with { Stale = l.Epoch < _compileEpoch }).ToList();
+
     public void ClearConsole() => _logs.Clear();
-    public void AddConsoleLog(ConsoleLogEntry entry) => _logs.Add(entry);
+
+    public void AddConsoleLog(ConsoleLogEntry entry)
+    {
+        var stamped = entry.Epoch == 0 ? entry with { Epoch = _compileEpoch } : entry;
+        _logs.Add(stamped with { Stale = false });
+    }
 
     // --- Editor state ---
 
-    public EditorState GetState() => new()
+    /// <summary>
+    /// Test hook (FR-R1): force a busy lifecycle phase so tools return immediate busy errors.
+    /// Pass null or <see cref="EditorLifecyclePhases.Connected"/> to clear.
+    /// </summary>
+    public void SimulateBusy(string? phase, int suggestedRetrySeconds = 2)
     {
-        IsCompiling = _state.IsCompiling,
-        IsPlaying = _state.IsPlaying,
-        IsPaused = _state.IsPaused,
-        ActiveScenePath = _active.Path
-    };
+        if (string.IsNullOrWhiteSpace(phase) ||
+            string.Equals(phase, EditorLifecyclePhases.Connected, StringComparison.OrdinalIgnoreCase))
+        {
+            _forcedPhase = null;
+            _state.IsCompiling = false;
+            return;
+        }
+
+        _forcedPhase = phase;
+        _forcedRetrySeconds = suggestedRetrySeconds > 0
+            ? suggestedRetrySeconds
+            : EditorLifecyclePhases.DefaultRetrySeconds(phase);
+        _state.IsCompiling = string.Equals(phase, EditorLifecyclePhases.EditorCompiling, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public void ClearBusy() => SimulateBusy(null);
+
+    /// <summary>
+    /// Test hook (O2 / FR-A5): simulate domain reload — bump sessionGeneration and retire prior GO ids.
+    /// </summary>
+    public void BumpSessionGeneration()
+    {
+        _sessionGeneration++;
+        RemintAllObjectIds();
+    }
+
+    public EditorState GetState()
+    {
+        var phase = ResolvePhase();
+        return new EditorState
+        {
+            IsCompiling = _state.IsCompiling ||
+                          string.Equals(phase, EditorLifecyclePhases.EditorCompiling, StringComparison.OrdinalIgnoreCase),
+            IsPlaying = _state.IsPlaying,
+            IsPaused = _state.IsPaused,
+            ActiveScenePath = _active.Path,
+            Phase = phase,
+            SuggestedRetrySeconds = EditorLifecyclePhases.IsBusy(phase) ? _forcedRetrySeconds : null,
+            CompileEpoch = _compileEpoch,
+            SessionGeneration = _sessionGeneration
+        };
+    }
+
+    private string ResolvePhase()
+    {
+        if (!string.IsNullOrEmpty(_forcedPhase))
+            return _forcedPhase!;
+        if (_state.IsCompiling)
+            return EditorLifecyclePhases.EditorCompiling;
+        return EditorLifecyclePhases.Connected;
+    }
 
     public void SetCompiling(bool compiling) => _state.IsCompiling = compiling;
 
@@ -132,8 +216,9 @@ public sealed class InMemoryEditorHost : IEditorHost
         _state.IsCompiling = true;
         // Recompile clears compile/file-scoped errors for scripts that exist after write (full code-fix loop).
         _logs.RemoveAll(IsClearedByRecompile);
+        _compileEpoch++;
         _state.IsCompiling = false;
-        _logs.Add(new ConsoleLogEntry(LogType.Log, "Scripts recompiled (headless)."));
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, "Scripts recompiled (headless).", Epoch: _compileEpoch));
     }
 
     private bool IsClearedByRecompile(ConsoleLogEntry log)
@@ -158,7 +243,7 @@ public sealed class InMemoryEditorHost : IEditorHost
         _state.IsPlaying = playing;
         _state.IsPaused = paused && playing;
         if (!playing) _state.IsPaused = false;
-        _logs.Add(new ConsoleLogEntry(LogType.Log,
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log,
             playing ? (paused ? "Play mode paused." : "Entered play mode.") : "Exited play mode."));
     }
 
@@ -168,7 +253,7 @@ public sealed class InMemoryEditorHost : IEditorHost
         _frame++;
         _profiler.DeltaTimeMs = 16.67f;
         _profiler.Fps = 60f;
-        _logs.Add(new ConsoleLogEntry(LogType.Log, $"Play mode stepped frame {_frame}."));
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, $"Play mode stepped frame {_frame}."));
     }
 
     // --- Selection ---
@@ -214,7 +299,7 @@ public sealed class InMemoryEditorHost : IEditorHost
             l.Type == LogType.Error &&
             ((!string.IsNullOrEmpty(l.File) && NormalizePath(l.File!).Equals(path, StringComparison.OrdinalIgnoreCase)) ||
              l.Message.IndexOf(path, StringComparison.OrdinalIgnoreCase) >= 0));
-        _logs.Add(new ConsoleLogEntry(LogType.Log, $"Script written: {path}"));
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, $"Script written: {path}"));
     }
 
     public bool DeleteScript(string path)
@@ -290,7 +375,7 @@ public sealed class InMemoryEditorHost : IEditorHost
             _state.ActiveScenePath = path;
         }
         _active.Dirty = false;
-        _logs.Add(new ConsoleLogEntry(LogType.Log, $"Scene saved: {_active.Path}"));
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, $"Scene saved: {_active.Path}"));
     }
 
     public bool UnloadScene(string path)
@@ -324,6 +409,8 @@ public sealed class InMemoryEditorHost : IEditorHost
 
     public GameObjectData? FindGameObject(string idOrPath)
     {
+        ThrowIfStaleObjectId(idOrPath);
+
         if (Objects.TryGetValue(idOrPath, out var byId))
             return CloneGo(byId);
 
@@ -707,7 +794,7 @@ public sealed class InMemoryEditorHost : IEditorHost
     }
 
     public void RefreshAssets() =>
-        _logs.Add(new ConsoleLogEntry(LogType.Log, "AssetDatabase refreshed (headless)."));
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, "AssetDatabase refreshed (headless)."));
 
     public IReadOnlyList<string> ListShaders() => BuiltinShaders.ToList();
 
@@ -731,7 +818,7 @@ public sealed class InMemoryEditorHost : IEditorHost
         }
         var pkg = new PackageInfo { Name = name, Version = version, Source = source, DisplayName = name };
         _packages.Add(pkg);
-        _logs.Add(new ConsoleLogEntry(LogType.Log, $"Package added: {name}@{version}"));
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, $"Package added: {name}@{version}"));
         return pkg;
     }
 
@@ -781,7 +868,7 @@ public sealed class InMemoryEditorHost : IEditorHost
         if (item == null)
         {
             // Allow unknown menu paths for extensibility; log only
-            _logs.Add(new ConsoleLogEntry(LogType.Warning, $"Menu item not in catalog (executed anyway): {menuPath}"));
+            AddConsoleLog(new ConsoleLogEntry(LogType.Warning, $"Menu item not in catalog (executed anyway): {menuPath}"));
             return true;
         }
 
@@ -807,25 +894,114 @@ public sealed class InMemoryEditorHost : IEditorHost
         else if (menuPath.Equals("File/Save", StringComparison.OrdinalIgnoreCase))
             SaveScene();
 
-        _logs.Add(new ConsoleLogEntry(LogType.Log, $"Menu executed: {menuPath}"));
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, $"Menu executed: {menuPath}"));
         return true;
     }
 
     // --- Screenshots ---
 
-    public ScreenshotResult CaptureScreenshot(string source, string? targetId = null, int width = 1280, int height = 720)
+    /// <summary>
+    /// Test hook to inject a real PNG fixture for MCP image-protocol coverage.
+    /// Production/headless path leaves this null (honest blindness).
+    /// </summary>
+    public Func<string, string?, int, int, int, int?, int?, int?, int?, ScreenshotResult>? ScreenshotOverride { get; set; }
+
+    /// <summary>
+    /// Headless cannot see. Returns explicit blindness (<see cref="ScreenshotResult.IsRealPixels"/> = false)
+    /// unless <see cref="ScreenshotOverride"/> supplies a fixture.
+    /// </summary>
+    public ScreenshotResult CaptureScreenshot(
+        string source,
+        string? targetId = null,
+        int width = 1280,
+        int height = 720,
+        int maxResolution = 640,
+        int? regionX = null,
+        int? regionY = null,
+        int? regionWidth = null,
+        int? regionHeight = null)
     {
-        var marker = $"screenshot:{source}:{targetId ?? "none"}:{width}x{height}:{Guid.NewGuid():N}";
+        if (ScreenshotOverride != null)
+            return ScreenshotOverride(source, targetId, width, height, maxResolution, regionX, regionY, regionWidth, regionHeight);
+
         return new ScreenshotResult
         {
             Source = source,
             TargetId = targetId,
             Width = width,
             Height = height,
-            Note = "Headless synthetic capture marker (no GPU). Live bridge returns camera PNG when available.",
-            PayloadMarker = marker
+            IsRealPixels = false,
+            PngBase64 = null,
+            FilePath = null,
+            OverlayUiIncluded = null,
+            Format = "none",
+            Note =
+                "Headless InMemoryEditorHost cannot capture real pixels. " +
+                "Open a live Unity Editor with the Unity-Comdr bridge (UNITYCOMDR_LIVE=1) " +
+                "and retry screenshot_capture with a camera or Scene View available."
         };
     }
+
+    // --- P1 interaction / lease (pre-existing interface surface; required for compile) ---
+
+    public IReadOnlyList<UiControlInfo> QueryUi(string? filter = null)
+    {
+        IEnumerable<UiControlInfo> q = _uiControls.Values;
+        if (!string.IsNullOrWhiteSpace(filter))
+        {
+            q = q.Where(c =>
+                c.Name.Contains(filter, StringComparison.OrdinalIgnoreCase) ||
+                (c.Path?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false) ||
+                c.Id.Contains(filter, StringComparison.OrdinalIgnoreCase));
+        }
+        return q.ToList();
+    }
+
+    public InputSimulateResult SimulateInput(
+        string action,
+        string? target = null,
+        float? x = null,
+        float? y = null,
+        float? toX = null,
+        float? toY = null,
+        float? deltaX = null,
+        float? deltaY = null,
+        string? key = null)
+    {
+        var note = $"simulated {action}" +
+                   (target != null ? $" target={target}" : "") +
+                   (key != null ? $" key={key}" : "");
+        _inputLog.Add(note);
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, note));
+        return new InputSimulateResult
+        {
+            Ok = true,
+            Action = action,
+            Target = target,
+            Note = note,
+            Effects =
+            {
+                ["x"] = x,
+                ["y"] = y,
+                ["toX"] = toX,
+                ["toY"] = toY,
+                ["deltaX"] = deltaX,
+                ["deltaY"] = deltaY,
+                ["key"] = key
+            }
+        };
+    }
+
+    public LeaseInfo GetLease() => _lease.GetLease();
+
+    public LeaseInfo AcquireLease(string agentId, double ttlSeconds) =>
+        _lease.Acquire(agentId, ttlSeconds);
+
+    public bool ReleaseLease(string agentId) =>
+        _lease.Release(agentId, out _);
+
+    public LeaseAuthorization AuthorizeWrite(string? agentId, bool requireHeld = false) =>
+        _lease.AuthorizeWrite(agentId, requireHeld);
 
     // --- Profiler ---
 
@@ -879,7 +1055,7 @@ public sealed class InMemoryEditorHost : IEditorHost
     {
         path = NormalizePath(path);
         _profilerSaves[path] = GetProfilerSnapshot();
-        _logs.Add(new ConsoleLogEntry(LogType.Log, $"Profiler snapshot saved: {path}"));
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, $"Profiler snapshot saved: {path}"));
     }
 
     public ProfilerSnapshot? LoadProfilerData(string path)
@@ -919,10 +1095,65 @@ public sealed class InMemoryEditorHost : IEditorHost
 
     private GameObjectData? ResolveMutable(string idOrPath)
     {
+        ThrowIfStaleObjectId(idOrPath);
         if (Objects.TryGetValue(idOrPath, out var byId))
             return byId;
         var found = FindGameObject(idOrPath);
         return found == null ? null : Objects[found.Id];
+    }
+
+    private void ThrowIfStaleObjectId(string idOrPath)
+    {
+        if (string.IsNullOrWhiteSpace(idOrPath)) return;
+        // Hierarchy paths are stable across reload; only bare ids are generation-scoped.
+        if (idOrPath.Contains('/')) return;
+        if (!_staleObjectIds.Contains(idOrPath)) return;
+        throw new InvalidOperationException(
+            $"stale_reference: GameObject id '{idOrPath}' is invalid after domain reload " +
+            $"(sessionGeneration={_sessionGeneration}). Re-find by hierarchy path, then retry with the new id.");
+    }
+
+    private void RemintAllObjectIds()
+    {
+        var globalRemap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var scenePath in _objectsByScene.Keys.ToList())
+        {
+            var oldMap = _objectsByScene[scenePath];
+            var remap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var oldId in oldMap.Keys)
+            {
+                var newId = Guid.NewGuid().ToString("N")[..8];
+                while (remap.ContainsValue(newId) || oldMap.ContainsKey(newId) || globalRemap.ContainsValue(newId))
+                    newId = Guid.NewGuid().ToString("N")[..8];
+                remap[oldId] = newId;
+                globalRemap[oldId] = newId;
+                _staleObjectIds.Add(oldId);
+            }
+
+            var next = new Dictionary<string, GameObjectData>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (oldId, go) in oldMap)
+            {
+                go.Id = remap[oldId];
+                if (go.ParentId != null && remap.TryGetValue(go.ParentId, out var newParent))
+                    go.ParentId = newParent;
+                go.ChildIds = go.ChildIds.Select(c => remap.TryGetValue(c, out var nc) ? nc : c).ToList();
+                next[go.Id] = go;
+            }
+            _objectsByScene[scenePath] = next;
+
+            if (_scenes.TryGetValue(scenePath, out var scene))
+            {
+                scene.RootObjectIds = scene.RootObjectIds
+                    .Select(id => remap.TryGetValue(id, out var nid) ? nid : id)
+                    .ToList();
+            }
+        }
+
+        _selection.GameObjectIds = _selection.GameObjectIds
+            .Select(id => globalRemap.TryGetValue(id, out var nid) ? nid : id)
+            .Where(id => !_staleObjectIds.Contains(id))
+            .ToList();
     }
 
     private void EnsureParentFolder(string assetPath)

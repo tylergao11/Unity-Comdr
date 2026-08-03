@@ -15,7 +15,20 @@ The 2026-08-02 requirements predate three frontier shifts confirmed on 2026-08-0
 2. Client config moved to **one-click deeplinks and committable project-local files** (Cursor/VS Code deeplinks; CoderGamester 1.4.0 project-relative auto-config; Unity official auto-configure).
 3. Unity's **official MCP** (Unity 6 + `com.unity.ai.assistant`) set a trust bar: connection approval, per-tool toggles, PID/project-path instance targeting.
 
-The original document's thesis (token-frugal, UPM-only, skills-first, solo-first) survives unchanged. The additions below sharpen *verification by sight*, *install friction*, *transition resilience*, and *trust*.
+The original document's packaging thesis (UPM-only, skills-first, solo-first, token-frugal) survives — **with a priority correction**:
+
+### Priority correction (locks over 2026-08-02 Cost model)
+
+The 2026-08-02 §Cost model listed **LLM token cost** as primary. That is amended:
+
+1. **Primary — 精准 / 准确 (fidelity).** Agent-visible state (vision pixels + MCP image modality, console, hierarchy, editor busy/error) must match the live Editor. No fake-done, no marker-as-sight, no optimization that lies.
+2. **Secondary — 节省 / 优化 (thrift).** Small default tool set, skills on demand, pagination, vision resolution caps, composites — applied *only on top of* (1).
+3. **Tertiary — user money** (free local, no mandatory cloud) — unchanged.
+4. **Quaternary — install/ops cost** (no Python/Node) — unchanged.
+
+**Rule:** if thrift and fidelity conflict, **fidelity wins**. Token-frugal remains a differentiator, not an excuse to ship inaccurate verification. Full prose: [`docs/product-ux-frontier.md`](../product-ux-frontier.md) §0 / PR-0.
+
+The additions below sharpen *verification by sight*, *install friction*, *transition resilience*, and *trust*.
 
 ---
 
@@ -24,7 +37,7 @@ The original document's thesis (token-frugal, UPM-only, skills-first, solo-first
 ### FR-VIS — Agent vision (upgrades P1 "Screenshots" from feature to acceptance-gated capability)
 
 - **FR-V1:** Screenshot tool results MUST use MCP `type:"image"` content blocks (base64 + mimeType) per current MCP spec — never base64 embedded in a text block. (Debt `VISION-MCP-IMAGE`.)
-- **FR-V2:** Default captures are resolution-capped (≤ 640 px longest edge, overridable) and multi-angle captures return a single labeled composite. Vision cost is a documented budget, sibling to the ≤15-tool schema budget.
+- **FR-V2:** After FR-V1/FR-V3 fidelity is satisfied, default captures MAY be resolution-capped (≤ 640 px longest edge, overridable) and multi-angle captures return a single labeled composite. Vision cost is a documented **order-2** budget — never a reason to drop image content type, Overlay UI, or honest failure.
 - **FR-V3:** Game-view capture includes Screen Space – Overlay UI by default; camera-specific capture documents its overlay exclusion. No-camera and headless situations return explicit machine-readable failures — synthetic markers never masquerade as sight. (Debts `VISION-SCENE-VIEW`, `VISION-LIVE-ONLY`.)
 - **FR-V4:** "Agent can see UI" may only be claimed after the full AC-V1…AC-V8 acceptance table in [`docs/product-ux-frontier.md`](../product-ux-frontier.md) §5 passes, including a human-verified live client session.
 

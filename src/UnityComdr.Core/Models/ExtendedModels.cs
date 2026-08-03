@@ -33,13 +33,19 @@ public sealed class ProfilerSnapshot
 public sealed class ScreenshotResult
 {
     public string Source { get; set; } = ""; // camera | game_view | scene_view | isolated
-    public string Format { get; set; } = "png-base64-stub";
+    public string Format { get; set; } = "png";
     public string? Note { get; set; }
     public string? TargetId { get; set; }
-    public int Width { get; set; } = 1280;
-    public int Height { get; set; } = 720;
-    /// <summary>Headless: synthetic payload marker (not a real image).</summary>
-    public string PayloadMarker { get; set; } = "";
+    public int Width { get; set; }
+    public int Height { get; set; }
+    /// <summary>Inline PNG as base64 when <see cref="IsRealPixels"/> is true.</summary>
+    public string? PngBase64 { get; set; }
+    /// <summary>Optional on-disk path for the full PNG.</summary>
+    public string? FilePath { get; set; }
+    /// <summary>True only when real GPU/Editor pixels were captured. Headless must stay false.</summary>
+    public bool IsRealPixels { get; set; }
+    /// <summary>Whether Screen Space – Overlay UI was included (game_view composited path).</summary>
+    public bool? OverlayUiIncluded { get; set; }
 }
 
 public sealed class FolderRecord

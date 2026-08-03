@@ -36,7 +36,7 @@ public static class DomainSkills
     public static IReadOnlyList<(string Id, string Name, string Description, string ParitySource)> CatalogMeta() =>
         new (string, string, string, string)[]
         {
-            (TestingId, "Testing", "EditMode/PlayMode-style test run & list", "IvanMurzak tests-run / CoderGamester run_tests"),
+            (TestingId, "Testing", "EditMode/PlayMode test job (tests_run → tests_status)", "Coplay RunTests/GetTestJob + IvanMurzak tests-run"),
             (PrefabAdvancedId, "Prefab Advanced", "Batch instantiate & prefab listing", "IvanMurzak prefab suite / AnkleBreaker breadth"),
             (PlayModeId, "Play Mode", "play|pause|stop|step", "CoderGamester set_play_mode / IvanMurzak editor-application-set-state"),
             (SelectionId, "Selection", "get/set Editor selection", "IvanMurzak editor-selection-*"),
@@ -251,28 +251,76 @@ public static class DomainSkills
     {
         Id = ScreenshotsId,
         Name = "Screenshots",
-        Description = "Capture camera / game view / scene view / isolated GO (IvanMurzak screenshot suite).",
+        Description = "Capture camera / game view / scene view / isolated GO. Returns MCP image content when live pixels are available.",
         Tools = new[]
         {
             Tool("screenshot_capture", ScreenshotsId,
-                "Capture a view. source: camera|game_view|scene_view|isolated.",
+                "Capture a view as real pixels (MCP type:image). " +
+                "source: camera|game_view|scene_view|isolated. " +
+                "maxResolution default 640 applies to whole-frame only (cost knob); region crops stay native resolution. " +
+                "game_view without target uses ScreenCapture (includes Overlay UI); camera/target uses camera.Render (overlay excluded).",
                 JsonSchemaHelper.Object(
                     ("source", JsonSchemaHelper.String(null, new[] { "camera", "game_view", "scene_view", "isolated" }), true),
                     ("target", JsonSchemaHelper.String("Camera or GO id for camera/isolated"), false),
-                    ("width", JsonSchemaHelper.Integer(), false),
-                    ("height", JsonSchemaHelper.Integer(), false)
+                    ("width", JsonSchemaHelper.Integer("Capture buffer width hint (camera path)"), false),
+                    ("height", JsonSchemaHelper.Integer("Capture buffer height hint (camera path)"), false),
+                    ("maxResolution", JsonSchemaHelper.Integer("Whole-frame longest-edge cap (default 640). Ignored for region crops."), false),
+                    ("regionX", JsonSchemaHelper.Integer("Crop X (top-left origin). Native resolution — no 640 downscale."), false),
+                    ("regionY", JsonSchemaHelper.Integer("Crop Y (top-left origin). Native resolution — no 640 downscale."), false),
+                    ("regionWidth", JsonSchemaHelper.Integer("Crop width in pixels."), false),
+                    ("regionHeight", JsonSchemaHelper.Integer("Crop height in pixels."), false)
                 ),
                 async (args, _) =>
                 {
                     var source = Arg(args, "source") ?? "game_view";
-                    var w = 1280;
-                    var h = 720;
-                    if (args != null && args.TryGetPropertyValue("width", out var wn) && wn is JsonValue wv && wv.TryGetValue<int>(out var wi))
-                        w = wi;
-                    if (args != null && args.TryGetPropertyValue("height", out var hn) && hn is JsonValue hv && hv.TryGetValue<int>(out var hi))
-                        h = hi;
-                    var result = editor.CaptureScreenshot(source, Arg(args, "target"), w, h);
-                    return ToolResult.OkJson(result);
+                    var w = IntArg(args, "width") ?? 1280;
+                    var h = IntArg(args, "height") ?? 720;
+                    var maxRes = IntArg(args, "maxResolution") ?? 640;
+                    var regionX = IntArg(args, "regionX");
+                    var regionY = IntArg(args, "regionY");
+                    var regionW = IntArg(args, "regionWidth");
+                    var regionH = IntArg(args, "regionHeight");
+                    try
+                    {
+                        var result = editor.CaptureScreenshot(
+                            source, Arg(args, "target"), w, h, maxRes, regionX, regionY, regionW, regionH);
+
+                        if (result.IsRealPixels && !string.IsNullOrEmpty(result.PngBase64))
+                        {
+                            // Metadata only — PNG lives in Images, never embedded in text.
+                            var meta = new
+                            {
+                                source = result.Source,
+                                format = result.Format,
+                                width = result.Width,
+                                height = result.Height,
+                                filePath = result.FilePath,
+                                isRealPixels = true,
+                                overlayUiIncluded = result.OverlayUiIncluded,
+                                note = result.Note,
+                                targetId = result.TargetId
+                            };
+                            return ToolResult.OkWithImages(
+                                System.Text.Json.JsonSerializer.Serialize(meta, CompactResults.JsonOptions),
+                                new[]
+                                {
+                                    new ToolImageContent
+                                    {
+                                        MimeType = "image/png",
+                                        DataBase64 = result.PngBase64!
+                                    }
+                                },
+                                structured: meta);
+                        }
+
+                        return ToolResult.Error(
+                            result.Note
+                            ?? "No real pixels available. Load a live Unity Editor with the Unity-Comdr bridge and ensure a camera or Scene View exists.");
+                    }
+                    catch (Exception ex)
+                    {
+                        return ToolResult.Error(ex.Message);
+                    }
                 })
         }
     };
@@ -285,10 +333,11 @@ public static class DomainSkills
         Tools = new[]
         {
             Tool("batch_execute", BatchId,
-                "Run sequential tool calls. Pass calls as JSON array string: [{\"name\":\"...\",\"arguments\":{...}}, ...]. stopOnError default true.",
+                "Run sequential tool calls. Pass calls as JSON array string: [{\"name\":\"...\",\"arguments\":{...}}, ...]. stopOnError default true. dryRun=true returns impact list without executing.",
                 JsonSchemaHelper.Object(
                     ("callsJson", JsonSchemaHelper.String("JSON array of {name, arguments}"), true),
-                    ("stopOnError", JsonSchemaHelper.Boolean("Stop on first error (default true)"), false)
+                    ("stopOnError", JsonSchemaHelper.Boolean("Stop on first error (default true)"), false),
+                    ("dryRun", JsonSchemaHelper.Boolean("Preview planned calls without mutating (default false)"), false)
                 ),
                 async (args, ct) =>
                 {
@@ -296,11 +345,35 @@ public static class DomainSkills
                     var stopOnError = true;
                     if (args != null && args.TryGetPropertyValue("stopOnError", out var s) && s is JsonValue jv && jv.TryGetValue<bool>(out var b))
                         stopOnError = b;
+                    var dryRun = false;
+                    if (args != null && args.TryGetPropertyValue("dryRun", out var d) && d is JsonValue dv && dv.TryGetValue<bool>(out var db))
+                        dryRun = db;
 
                     JsonArray? arr;
                     try { arr = JsonNode.Parse(json) as JsonArray; }
                     catch (Exception ex) { return ToolResult.Error("Invalid callsJson: " + ex.Message); }
                     if (arr == null) return ToolResult.Error("callsJson must be a JSON array");
+
+                    if (dryRun)
+                    {
+                        var planned = new List<object>();
+                        foreach (var item in arr)
+                        {
+                            if (item is not JsonObject call)
+                            {
+                                planned.Add(new { error = "invalid call entry" });
+                                continue;
+                            }
+                            var name = call["name"]?.GetValue<string>();
+                            planned.Add(new
+                            {
+                                name = name ?? "(missing)",
+                                arguments = call["arguments"]?.ToJsonString() ?? "{}",
+                                wouldExecute = !string.IsNullOrEmpty(name)
+                            });
+                        }
+                        return ToolResult.OkJson(new { dryRun = true, count = planned.Count, wouldExecute = planned });
+                    }
 
                     var results = new List<object>();
                     foreach (var item in arr)
@@ -347,6 +420,15 @@ public static class DomainSkills
     {
         if (args == null || !args.TryGetPropertyValue(key, out var n) || n is null) return null;
         return n.GetValue<string>();
+    }
+
+    private static int? IntArg(JsonObject? args, string key)
+    {
+        if (args == null || !args.TryGetPropertyValue(key, out var n) || n is not JsonValue jv)
+            return null;
+        if (jv.TryGetValue<int>(out var i)) return i;
+        if (jv.TryGetValue<long>(out var l)) return (int)l;
+        return null;
     }
 
     private static IReadOnlyList<string> SplitCsv(string? csv) =>
