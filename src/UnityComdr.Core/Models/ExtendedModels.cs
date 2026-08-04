@@ -46,6 +46,12 @@ public sealed class ScreenshotResult
     public bool IsRealPixels { get; set; }
     /// <summary>Whether Screen Space – Overlay UI was included (game_view composited path).</summary>
     public bool? OverlayUiIncluded { get; set; }
+    /// <summary>none | surround — surround is a single labeled contact sheet (AC-V7).</summary>
+    public string? Batch { get; set; }
+    /// <summary>True when region crop preserved native resolution (AC-V9).</summary>
+    public bool RegionNative { get; set; }
+    /// <summary>True when whole-frame maxResolution cost knob was applied.</summary>
+    public bool WholeFrameDownscaled { get; set; }
 }
 
 public sealed class FolderRecord

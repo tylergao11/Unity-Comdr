@@ -56,7 +56,26 @@ public sealed class ResourceCatalog
                 payload = _editor.GetState();
                 break;
             case "unity://packages":
-                payload = new { packages = _editor.ListPackages() };
+                if (!string.Equals(_editor.HostMode, "live", StringComparison.OrdinalIgnoreCase))
+                {
+                    payload = new
+                    {
+                        hostMode = _editor.HostMode,
+                        packages = Array.Empty<object>(),
+                        error = "package list requires hostMode=live (PackageManager.Client)"
+                    };
+                }
+                else
+                {
+                    try
+                    {
+                        payload = new { hostMode = _editor.HostMode, packages = _editor.ListPackages() };
+                    }
+                    catch (Exception ex)
+                    {
+                        payload = new { hostMode = _editor.HostMode, packages = Array.Empty<object>(), error = ex.Message };
+                    }
+                }
                 break;
             case "unity://assets":
                 payload = CompactResults.Paginate(

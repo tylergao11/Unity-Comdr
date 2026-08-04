@@ -24,7 +24,7 @@ public class VisionProtocolTests
     {
         var host = new InMemoryEditorHost
         {
-            ScreenshotOverride = (_, _, _, _, _, _, _, _, _) => new ScreenshotResult
+            ScreenshotOverride = (_, _, _, _, _, _, _, _, _, _) => new ScreenshotResult
             {
                 Source = "game_view",
                 Width = 1,
@@ -33,6 +33,8 @@ public class VisionProtocolTests
                 IsRealPixels = true,
                 OverlayUiIncluded = true,
                 PngBase64 = TinyPngBase64,
+                Batch = "none",
+                RegionNative = false,
                 Note = "Fixture PNG for vision protocol test."
             }
         };
@@ -78,7 +80,11 @@ public class VisionProtocolTests
         Assert.NotNull(call);
         Assert.True(call!["result"]?["isError"]?.GetValue<bool>());
         var text = call["result"]?["content"]?[0]?["text"]?.GetValue<string>() ?? "";
-        Assert.Contains("real pixels", text, StringComparison.OrdinalIgnoreCase);
+        Assert.True(
+            text.Contains("real pixels", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("no live Editor", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("no_live_pixels", StringComparison.OrdinalIgnoreCase),
+            "headless error must name no-live-pixels failure, got: " + text);
         Assert.DoesNotContain("payloadMarker", text, StringComparison.OrdinalIgnoreCase);
 
         var content = call["result"]?["content"] as JsonArray;

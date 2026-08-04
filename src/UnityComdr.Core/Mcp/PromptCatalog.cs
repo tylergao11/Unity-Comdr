@@ -18,7 +18,7 @@ public sealed class PromptCatalog
         new PromptDescriptor(
             "playmode_verify_loop",
             "Play Mode Verify Loop",
-            "Load playmode skill → enter play → capture screenshot/state → stop → fix issues."),
+            "Load playmode + screenshots → play → screenshot_capture (MCP image) → judge from image → stop → fix."),
         new PromptDescriptor(
             "skill_expansion",
             "Skill Expansion",
@@ -44,14 +44,21 @@ public sealed class PromptCatalog
             "2) hierarchy_get for compact structure.\n" +
             "3) gameobject_manage create (use primitive when useful); component_manage add.\n" +
             "4) assets_manage for materials/prefabs; set_transform with partial axes as needed.\n" +
-            "5) scene_manage action=save.\n" +
-            "Prefer compact hierarchy_get over dumping every property.",
+            "5) Vision checkpoint: skill_manage load screenshots; screenshot_capture source=game_view " +
+            "(MCP type:image). Judge assembly from the image (camera framing, objects not stacked at origin).\n" +
+            "6) scene_manage action=save.\n" +
+            "Prefer compact hierarchy_get over dumping every property. maxResolution=640 is a cost knob for whole-frame only.",
         "playmode_verify_loop" =>
-            "You are verifying gameplay via Unity-Comdr MCP.\n" +
-            "1) skill_manage action=load id=playmode (and screenshots if needed).\n" +
-            "2) playmode_control action=play; optionally step/pause.\n" +
-            "3) screenshot_capture source=game_view; editor_state / console_read.\n" +
-            "4) playmode_control action=stop; fix scripts/scene; retest.",
+            "You are verifying gameplay via Unity-Comdr MCP with VISION checkpoints (required).\n" +
+            "1) skill_manage action=load id=playmode; skill_manage action=load id=screenshots.\n" +
+            "2) Confirm editor_state hostMode=live (headless cannot see pixels).\n" +
+            "3) playmode_control action=play; optionally step/pause.\n" +
+            "4) screenshot_capture source=game_view (returns MCP type:image png). " +
+            "Optionally batch=surround target=<go> for one contact sheet, or region crop for UI detail (native res).\n" +
+            "5) JUDGE FROM THE IMAGE ALONE (labels visible? spawn? layout). Do not invent pixels from hierarchy text.\n" +
+            "6) On failure: screenshot_capture source=scene_view or isolated target=<id>; then fix scene/scripts.\n" +
+            "7) playmode_control action=stop; retest until image matches the goal.\n" +
+            "Busy etiquette: if editor_compiling/editor_reloading, wait suggestedRetrySeconds and retry.",
         "skill_expansion" =>
             "Keep the default tool set small.\n" +
             "1) skill_manage action=list — review id/description.\n" +

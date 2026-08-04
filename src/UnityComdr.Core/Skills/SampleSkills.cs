@@ -1,31 +1,18 @@
-using System.Collections.Concurrent;
 using System.Text.Json.Nodes;
 using UnityComdr.Editor;
+using UnityComdr.Models;
 using UnityComdr.Tools;
 using UnityComdr.Util;
 
 namespace UnityComdr.Skills;
 
 /// <summary>
-/// Sample domain skills proving the loader. Loaded only via skill_manage.
+/// Sample domain skills. Testing uses live TestRunnerApi via IEditorHost — never fakes console/script counts as tests.
 /// </summary>
 public static class SampleSkills
 {
     public const string TestingSkillId = "testing";
     public const string PrefabAdvancedSkillId = "prefab-advanced";
-
-    private sealed class TestJobState
-    {
-        public required string JobId { get; init; }
-        public required string Status { get; set; }
-        public required string Mode { get; init; }
-        public string? Filter { get; init; }
-        public bool Passed { get; set; }
-        public List<object> Results { get; init; } = new();
-    }
-
-    /// <summary>In-memory test jobs (Coplay RunTests/GetTestJob pattern — mode start + poll).</summary>
-    private static readonly ConcurrentDictionary<string, TestJobState> TestJobs = new(StringComparer.OrdinalIgnoreCase);
 
     public static void RegisterAll(ToolRegistry registry, IEditorHost editor)
     {
@@ -41,7 +28,7 @@ public static class SampleSkills
             {
                 Name = "tests_run",
                 Description =
-                    "Start a test job (Coplay run_tests pattern). Returns {jobId, status}. Poll with tests_status. mode: EditMode|PlayMode.",
+                    "Start Unity Test Runner job (live hostMode only, TestRunnerApi). Returns {jobId,status}. Poll tests_status. mode: EditMode|PlayMode. Headless returns isError (no fake results).",
                 SkillId = TestingSkillId,
                 InputSchema = JsonSchemaHelper.Object(
                     ("filter", JsonSchemaHelper.String("Optional name filter"), false),
@@ -49,6 +36,12 @@ public static class SampleSkills
                 ),
                 Handler = async (args, _) =>
                 {
+                    if (!IsLive(editor))
+                        return await Task.FromResult(ToolResult.ErrorEnvelope(
+                            "requires_live",
+                            "tests_run requires hostMode=live (Unity TestRunnerApi). Headless does not simulate tests.",
+                            nextStep: "Open Unity with Unity-Comdr bridge, confirm editor_state.hostMode=live, then retry."));
+
                     var mode = args != null && args.TryGetPropertyValue("mode", out var m) && m != null
                         ? m.GetValue<string>()
                         : "EditMode";
@@ -56,57 +49,54 @@ public static class SampleSkills
                         ? f.GetValue<string>()
                         : null;
 
-                    var scripts = editor.ListScripts();
-                    var errors = editor.GetConsoleLogs().Count(l => l.Type == Models.LogType.Error);
-                    var passed = errors == 0;
-                    var results = new List<object>
+                    TestJobSnapshot job;
+                    try
                     {
-                        new
-                        {
-                            name = "Console_NoErrors",
-                            status = passed ? "Passed" : "Failed",
-                            message = passed ? "No error logs" : $"{errors} error(s) in console"
-                        },
-                        new
-                        {
-                            name = "Scripts_Present",
-                            status = scripts.Count >= 0 ? "Passed" : "Failed",
-                            message = $"{scripts.Count} script(s)"
-                        }
-                    };
-                    if (!string.IsNullOrEmpty(filter))
-                        results = results.Where(r => r.ToString()!.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();
+                        job = editor.StartTests(mode ?? "EditMode", filter);
+                    }
+                    catch (Exception ex)
+                    {
+                        return ToolResult.ErrorEnvelope(
+                            "testrunner_error",
+                            ex.Message,
+                            nextStep: "Ensure com.unity.test-framework is installed and Test Runner window works.");
+                    }
 
-                    var jobId = Guid.NewGuid().ToString("N")[..12];
-                    // Headless/InMemory completes immediately (live Unity would stay running until Test Runner finishes).
-                    var job = new TestJobState
+                    if (string.Equals(job.Status, "unsupported", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(job.Status, "failed", StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(job.JobId))
                     {
-                        JobId = jobId,
-                        Status = "completed",
-                        Mode = mode ?? "EditMode",
-                        Filter = filter,
-                        Passed = passed,
-                        Results = results
-                    };
-                    TestJobs[jobId] = job;
+                        return ToolResult.ErrorEnvelope(
+                            "testrunner_unavailable",
+                            job.Note ?? "TestRunnerApi unavailable on this Editor.",
+                            nextStep: "Install Test Framework package or run tests manually in Unity.");
+                    }
 
                     return await Task.FromResult(ToolResult.OkJson(new
                     {
-                        jobId,
-                        status = job.Status
+                        jobId = job.JobId,
+                        status = job.Status,
+                        mode = job.Mode,
+                        hostMode = editor.HostMode,
+                        note = job.Note
                     }));
                 }
             },
             new()
             {
                 Name = "tests_status",
-                Description = "Poll a test job started by tests_run (Coplay get_test_job pattern). Pass jobId.",
+                Description = "Poll a test job started by tests_run (live TestRunnerApi). Pass jobId.",
                 SkillId = TestingSkillId,
                 InputSchema = JsonSchemaHelper.Object(
                     ("jobId", JsonSchemaHelper.String("Job id from tests_run"), true)
                 ),
                 Handler = async (args, _) =>
                 {
+                    if (!IsLive(editor))
+                        return await Task.FromResult(ToolResult.ErrorEnvelope(
+                            "requires_live",
+                            "tests_status requires hostMode=live.",
+                            nextStep: "Use live Unity bridge."));
+
                     var jobId = args?["jobId"]?.GetValue<string>();
                     if (string.IsNullOrWhiteSpace(jobId))
                         return ToolResult.ErrorEnvelope(
@@ -114,37 +104,70 @@ public static class SampleSkills
                             "Missing required parameter 'jobId'.",
                             nextStep: "Pass jobId from the tests_run response.");
 
-                    if (!TestJobs.TryGetValue(jobId!, out var job))
-                        return ToolResult.ErrorEnvelope(
-                            "unknown_job",
-                            $"Unknown jobId: {jobId}",
-                            nextStep: "Call tests_run to start a job, then poll with the returned jobId.");
-
-                    return await Task.FromResult(ToolResult.OkJson(new
+                    try
                     {
-                        jobId = job.JobId,
-                        status = job.Status,
-                        mode = job.Mode,
-                        filter = job.Filter,
-                        passed = job.Passed,
-                        results = job.Results
-                    }));
+                        var job = editor.GetTestJob(jobId!);
+                        if (string.Equals(job.Status, "unsupported", StringComparison.OrdinalIgnoreCase))
+                            return ToolResult.ErrorEnvelope(
+                                "testrunner_unavailable",
+                                job.Note ?? "unsupported",
+                                nextStep: "Start a job with tests_run on live Editor.");
+
+                        return await Task.FromResult(ToolResult.OkJson(new
+                        {
+                            jobId = job.JobId,
+                            status = job.Status,
+                            mode = job.Mode,
+                            filter = job.Filter,
+                            passed = job.Passed,
+                            results = job.Results,
+                            note = job.Note,
+                            hostMode = editor.HostMode
+                        }));
+                    }
+                    catch (Exception ex)
+                    {
+                        return ToolResult.ErrorEnvelope(
+                            "testrunner_error",
+                            ex.Message,
+                            nextStep: "Check jobId from tests_run / tests_list and Unity Test Runner.");
+                    }
                 }
             },
             new()
             {
                 Name = "tests_list",
-                Description = "List available logical tests (headless catalog).",
+                Description = "List tests discovered by Unity TestRunnerApi (live only). Empty/error on headless.",
                 SkillId = TestingSkillId,
-                InputSchema = JsonSchemaHelper.Object(),
-                Handler = async (_, _) => await Task.FromResult(ToolResult.OkJson(new
+                InputSchema = JsonSchemaHelper.Object(
+                    ("mode", JsonSchemaHelper.String("EditMode or PlayMode", new[] { "EditMode", "PlayMode" }), false)
+                ),
+                Handler = async (args, _) =>
                 {
-                    tests = new[]
+                    if (!IsLive(editor))
+                        return await Task.FromResult(ToolResult.ErrorEnvelope(
+                            "requires_live",
+                            "tests_list requires hostMode=live TestRunnerApi (no hardcoded fake catalog).",
+                            nextStep: "Open Unity with bridge connected."));
+
+                    var mode = args != null && args.TryGetPropertyValue("mode", out var m) && m != null
+                        ? m.GetValue<string>()
+                        : null;
+                    try
                     {
-                        new { name = "Console_NoErrors", mode = "EditMode" },
-                        new { name = "Scripts_Present", mode = "EditMode" }
+                        var tests = editor.ListTests(mode);
+                        return await Task.FromResult(ToolResult.OkJson(new
+                        {
+                            hostMode = editor.HostMode,
+                            tests
+                        }));
                     }
-                }))
+                    catch (Exception ex)
+                    {
+                        return ToolResult.ErrorEnvelope("testrunner_error", ex.Message,
+                            nextStep: "Check Test Framework package.");
+                    }
+                }
             }
         };
 
@@ -152,10 +175,13 @@ public static class SampleSkills
         {
             Id = TestingSkillId,
             Name = "Testing",
-            Description = "Test Runner helpers for EditMode/PlayMode-style checks (async job + poll).",
+            Description = "Unity Test Runner (TestRunnerApi) job start/poll/list — live Editor only.",
             Tools = tools
         };
     }
+
+    private static bool IsLive(IEditorHost editor) =>
+        string.Equals(editor.HostMode, "live", StringComparison.OrdinalIgnoreCase);
 
     private static SkillDefinition BuildPrefabAdvancedSkill(IEditorHost editor)
     {

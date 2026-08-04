@@ -1,8 +1,9 @@
 # Unity-Comdr 竞品对齐审计（完整版）
 
-**日期：** 2026-08-02  
-**版本：** Unity-Comdr 0.2.0  
-**审计范围：** 能力面、协议面、安装体验、Token 策略、安全默认、可扩展性、测试与文档  
+**日期：** 2026-08-02（矩阵正文）  
+**版本：** Unity-Comdr 0.2.0 文稿；**宣称资格以 2026-08-03 保真标准为准**  
+**重要：** 下文部分「✅ 已对齐」已过时。对外「支持 / 已对齐」**必须**服从 [`fidelity-audit-standard.md`](fidelity-audit-standard.md) + [`production-capability-audit.md`](production-capability-audit.md) 的 **Claim YES**。测试套件 **不** 证明对齐。  
+**审计范围：** 能力面、协议面、安装体验、Token 策略、安全默认、可扩展性  
 **对照对象：**
 
 | 项目 | 代表星数（审计时点量级） | 协议 / 安装特征 |
@@ -199,7 +200,7 @@ ComdrRuntime
 
 | 能力 | C | I | G | U | 实现说明 |
 |------|---|---|---|---|----------|
-| camera/game/scene/isolated | 部分 | ✓ | — | 🟨 | skill `screenshots`；headless 为 marker，live 需 Unity 桥。**偷懒债 `VISION-MCP-IMAGE`：** 现回 `type:text`+base64，未升格 MCP `type:image`，不得宣称 agent「真看见 UI」——见 `docs/audit.md` |
+| camera/game/scene/isolated | 部分 | ✓ | — | 🟨 | skill `screenshots`：**live** 返回 MCP `type:image`（png）；**headless** `isError`/`no_live_pixels`（无 marker）。产品「真看见」仍需 AC-V6 C4——见 `acceptance-criteria.md` / `audit.md`。旧「text+base64 / headless marker」叙述 **已废止**（以 `production-capability-audit.md` 为准）。 |
 | profiler start/stop/stats/save | 部分 | ✓ | — | 🟨 | skill `profiling`；headless 合成快照 |
 
 ### 4.9 Batch / 反射 / 动态执行

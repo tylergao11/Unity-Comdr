@@ -148,7 +148,7 @@ The four conditions in [`docs/audit.md`](audit.md) §Known execution shortcuts r
 
 ## 7. Design backlog（ordered — DOC-COMPLETE ONLY）
 
-> Every item's deliverable in this phase is a **written spec** (doc-complete). Implementation of any item is **EXECUTION: BLOCKED until the user unlocks it**. Order = product value order from §3.
+> **政策更新（2026-08-03）：** 废除「BLOCKED until unlock / 以后再说」。有用能力的强制验收见 [`acceptance-criteria.md`](acceptance-criteria.md)（有用即做）。下表 DB-* 仍可作为设计备忘，但 **不得** 当作延期许可证；排序只决定动手先后。
 
 | # | Item | Doc-complete definition (what the spec must contain) | Execution |
 |---|------|------------------------------------------------------|-----------|

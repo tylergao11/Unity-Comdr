@@ -36,7 +36,7 @@ public static class DomainSkills
     public static IReadOnlyList<(string Id, string Name, string Description, string ParitySource)> CatalogMeta() =>
         new (string, string, string, string)[]
         {
-            (TestingId, "Testing", "EditMode/PlayMode test job (tests_run → tests_status)", "Coplay RunTests/GetTestJob + IvanMurzak tests-run"),
+            (TestingId, "Testing", "Live TestRunnerApi job (tests_run → tests_status); headless isError", "Coplay RunTests/GetTestJob + Unity TestRunnerApi"),
             (PrefabAdvancedId, "Prefab Advanced", "Batch instantiate & prefab listing", "IvanMurzak prefab suite / AnkleBreaker breadth"),
             (PlayModeId, "Play Mode", "play|pause|stop|step", "CoderGamester set_play_mode / IvanMurzak editor-application-set-state"),
             (SelectionId, "Selection", "get/set Editor selection", "IvanMurzak editor-selection-*"),
@@ -121,11 +121,11 @@ public static class DomainSkills
     {
         Id = PackagesId,
         Name = "Package Manager",
-        Description = "UPM package list/add/remove/search.",
+        Description = "UPM via UnityEditor.PackageManager.Client (live only).",
         Tools = new[]
         {
             Tool("package_manage", PackagesId,
-                "Action: list|add|remove|search.",
+                "Action: list|add|remove|search via PackageManager.Client. Requires hostMode=live. Headless returns isError (no manifest fake).",
                 JsonSchemaHelper.Object(
                     ("action", JsonSchemaHelper.String(null, new[] { "list", "add", "remove", "search" }), true),
                     ("package", JsonSchemaHelper.String("Package id, url, or name@version"), false),
@@ -133,30 +133,44 @@ public static class DomainSkills
                 ),
                 async (args, _) =>
                 {
+                    if (!IsLive(editor))
+                        return ToolResult.ErrorEnvelope(
+                            "requires_live",
+                            "package_manage requires hostMode=live PackageManager.Client. Headless does not fake UPM.",
+                            nextStep: "Open Unity with Unity-Comdr bridge (editor_state.hostMode=live).");
+
                     var action = Arg(args, "action")?.ToLowerInvariant() ?? "list";
-                    switch (action)
+                    try
                     {
-                        case "list":
-                            return ToolResult.OkJson(new { packages = editor.ListPackages() });
-                        case "add":
+                        switch (action)
                         {
-                            var pkg = Arg(args, "package") ?? throw new ArgumentException("package required");
-                            return ToolResult.OkJson(editor.AddPackage(pkg));
+                            case "list":
+                                return ToolResult.OkJson(new { hostMode = editor.HostMode, packages = editor.ListPackages() });
+                            case "add":
+                            {
+                                var pkg = Arg(args, "package") ?? throw new ArgumentException("package required");
+                                return ToolResult.OkJson(new { hostMode = editor.HostMode, package = editor.AddPackage(pkg) });
+                            }
+                            case "remove":
+                            {
+                                var pkg = Arg(args, "package") ?? throw new ArgumentException("package required");
+                                return editor.RemovePackage(pkg)
+                                    ? ToolResult.OkJson(new { removed = pkg, hostMode = editor.HostMode })
+                                    : ToolResult.Error($"Package not found: {pkg}");
+                            }
+                            case "search":
+                            {
+                                var q = Arg(args, "query") ?? "";
+                                return ToolResult.OkJson(new { hostMode = editor.HostMode, results = editor.SearchPackages(q) });
+                            }
+                            default:
+                                return ToolResult.Error($"Unknown action: {action}");
                         }
-                        case "remove":
-                        {
-                            var pkg = Arg(args, "package") ?? throw new ArgumentException("package required");
-                            return editor.RemovePackage(pkg)
-                                ? ToolResult.Ok($"Removed {pkg}")
-                                : ToolResult.Error($"Package not found: {pkg}");
-                        }
-                        case "search":
-                        {
-                            var q = Arg(args, "query") ?? "";
-                            return ToolResult.OkJson(new { results = editor.SearchPackages(q) });
-                        }
-                        default:
-                            return ToolResult.Error($"Unknown action: {action}");
+                    }
+                    catch (Exception ex)
+                    {
+                        return ToolResult.ErrorEnvelope("package_error", ex.Message,
+                            nextStep: "Check package id and Unity Package Manager status.");
                     }
                 })
         }
@@ -166,11 +180,11 @@ public static class DomainSkills
     {
         Id = MenuId,
         Name = "Menu Items",
-        Description = "List and execute Unity menu items (CoderGamester execute_menu_item).",
+        Description = "List (curated whitelist, not full Unity menu tree) and execute menu items.",
         Tools = new[]
         {
             Tool("menu_manage", MenuId,
-                "Action: list|execute.",
+                "Action: list|execute. list returns a curated whitelist only (coverage LIMITED — not all Unity menus). execute uses EditorApplication.ExecuteMenuItem on live.",
                 JsonSchemaHelper.Object(
                     ("action", JsonSchemaHelper.String(null, new[] { "list", "execute" }), true),
                     ("path", JsonSchemaHelper.String("Menu path e.g. GameObject/Create Empty"), false),
@@ -180,13 +194,19 @@ public static class DomainSkills
                 {
                     var action = Arg(args, "action")?.ToLowerInvariant() ?? "list";
                     if (action == "list")
-                        return ToolResult.OkJson(new { items = editor.ListMenuItems(Arg(args, "filter")) });
+                        return ToolResult.OkJson(new
+                        {
+                            coverage = "whitelist",
+                            note = "Not a complete Unity menu catalog — curated paths only.",
+                            hostMode = editor.HostMode,
+                            items = editor.ListMenuItems(Arg(args, "filter"))
+                        });
                     if (action == "execute")
                     {
                         var path = Arg(args, "path") ?? throw new ArgumentException("path required");
                         return editor.ExecuteMenuItem(path)
                             ? ToolResult.OkJson(new { executed = path, state = editor.GetState() })
-                            : ToolResult.Error($"Menu execute failed: {path}");
+                            : ToolResult.Error($"Menu execute failed or path unknown: {path}");
                     }
                     return ToolResult.Error($"Unknown action: {action}");
                 })
@@ -197,17 +217,17 @@ public static class DomainSkills
     {
         Id = ProfilingId,
         Name = "Profiling",
-        Description = "Profiler start/stop/status/snapshot/save/load (IvanMurzak profiler suite).",
+        Description = "Memory/FPS metrics snapshot (Profiler.Get* counters). save/load is JSON metrics snapshot — NOT Unity Profiler .data binary.",
         Tools = new[]
         {
             Tool("profiler_manage", ProfilingId,
-                "Action: start|stop|status|capture|clear|save|load.",
+                "Action: start|stop|status|capture|clear|save|load. save/load store JSON metrics snapshots only (not official Profiler session files).",
                 JsonSchemaHelper.Object(
                     ("action", JsonSchemaHelper.String(null, new[]
                     {
                         "start", "stop", "status", "capture", "clear", "save", "load"
                     }), true),
-                    ("path", JsonSchemaHelper.String("Snapshot path for save/load"), false)
+                    ("path", JsonSchemaHelper.String("JSON metrics snapshot path for save/load"), false)
                 ),
                 async (args, _) =>
                 {
@@ -216,29 +236,45 @@ public static class DomainSkills
                     {
                         case "start":
                             editor.SetProfilerEnabled(true);
-                            return ToolResult.OkJson(editor.GetProfilerSnapshot());
+                            return ToolResult.OkJson(WrapProfiler(editor));
                         case "stop":
                             editor.SetProfilerEnabled(false);
-                            return ToolResult.OkJson(editor.GetProfilerSnapshot());
+                            return ToolResult.OkJson(WrapProfiler(editor));
                         case "status":
                         case "capture":
-                            return ToolResult.OkJson(editor.GetProfilerSnapshot());
+                            return ToolResult.OkJson(WrapProfiler(editor));
                         case "clear":
                             editor.ClearProfilerData();
-                            return ToolResult.Ok("Profiler data cleared.");
+                            return ToolResult.OkJson(new
+                            {
+                                cleared = true,
+                                note = "Counters reset; not a full Profiler window clear.",
+                                hostMode = editor.HostMode
+                            });
                         case "save":
                         {
-                            var path = Arg(args, "path") ?? "Assets/Profiler/snapshot.json";
+                            var path = Arg(args, "path") ?? "Temp/unity-comdr-profiler-metrics.json";
                             editor.SaveProfilerData(path);
-                            return ToolResult.OkJson(new { saved = path });
+                            return ToolResult.OkJson(new
+                            {
+                                saved = path,
+                                format = "json-metrics-snapshot",
+                                note = "Not a Unity Profiler binary capture.",
+                                hostMode = editor.HostMode
+                            });
                         }
                         case "load":
                         {
                             var path = Arg(args, "path") ?? throw new ArgumentException("path required");
                             var snap = editor.LoadProfilerData(path);
                             return snap == null
-                                ? ToolResult.Error($"Snapshot not found: {path}")
-                                : ToolResult.OkJson(snap);
+                                ? ToolResult.Error($"Metrics snapshot not found: {path}")
+                                : ToolResult.OkJson(new
+                                {
+                                    format = "json-metrics-snapshot",
+                                    snapshot = snap,
+                                    hostMode = editor.HostMode
+                                });
                         }
                         default:
                             return ToolResult.Error($"Unknown action: {action}");
@@ -255,20 +291,24 @@ public static class DomainSkills
         Tools = new[]
         {
             Tool("screenshot_capture", ScreenshotsId,
-                "Capture a view as real pixels (MCP type:image). " +
+                "Capture real pixels as MCP type:image (png). " +
                 "source: camera|game_view|scene_view|isolated. " +
-                "maxResolution default 640 applies to whole-frame only (cost knob); region crops stay native resolution. " +
-                "game_view without target uses ScreenCapture (includes Overlay UI); camera/target uses camera.Render (overlay excluded).",
+                "maxResolution default 640 is a WHOLE-FRAME cost knob only (not accuracy license). " +
+                "regionX/Y/Width/Height crops stay NATIVE resolution (AC-V9). " +
+                "batch=surround returns ONE labeled 6-angle contact sheet (AC-V7; requires target). " +
+                "game_view without target includes Overlay UI; camera path excludes overlay (see overlayUiIncluded). " +
+                "headless/no live Editor → isError (never marker success).",
                 JsonSchemaHelper.Object(
                     ("source", JsonSchemaHelper.String(null, new[] { "camera", "game_view", "scene_view", "isolated" }), true),
-                    ("target", JsonSchemaHelper.String("Camera or GO id for camera/isolated"), false),
+                    ("target", JsonSchemaHelper.String("Camera or GO id for camera/isolated/surround"), false),
                     ("width", JsonSchemaHelper.Integer("Capture buffer width hint (camera path)"), false),
                     ("height", JsonSchemaHelper.Integer("Capture buffer height hint (camera path)"), false),
-                    ("maxResolution", JsonSchemaHelper.Integer("Whole-frame longest-edge cap (default 640). Ignored for region crops."), false),
-                    ("regionX", JsonSchemaHelper.Integer("Crop X (top-left origin). Native resolution — no 640 downscale."), false),
-                    ("regionY", JsonSchemaHelper.Integer("Crop Y (top-left origin). Native resolution — no 640 downscale."), false),
-                    ("regionWidth", JsonSchemaHelper.Integer("Crop width in pixels."), false),
-                    ("regionHeight", JsonSchemaHelper.Integer("Crop height in pixels."), false)
+                    ("maxResolution", JsonSchemaHelper.Integer("Whole-frame longest-edge cap (default 640 cost knob). Ignored for region crops."), false),
+                    ("regionX", JsonSchemaHelper.Integer("Crop X (top-left). Native resolution — no 640 downscale."), false),
+                    ("regionY", JsonSchemaHelper.Integer("Crop Y (top-left). Native resolution — no 640 downscale."), false),
+                    ("regionWidth", JsonSchemaHelper.Integer("Crop width px (native)."), false),
+                    ("regionHeight", JsonSchemaHelper.Integer("Crop height px (native)."), false),
+                    ("batch", JsonSchemaHelper.String("none (default) or surround = single contact sheet", new[] { "none", "surround" }), false)
                 ),
                 async (args, _) =>
                 {
@@ -280,25 +320,31 @@ public static class DomainSkills
                     var regionY = IntArg(args, "regionY");
                     var regionW = IntArg(args, "regionWidth");
                     var regionH = IntArg(args, "regionHeight");
+                    var batch = Arg(args, "batch") ?? "none";
                     try
                     {
                         var result = editor.CaptureScreenshot(
-                            source, Arg(args, "target"), w, h, maxRes, regionX, regionY, regionW, regionH);
+                            source, Arg(args, "target"), w, h, maxRes, regionX, regionY, regionW, regionH, batch);
 
                         if (result.IsRealPixels && !string.IsNullOrEmpty(result.PngBase64))
                         {
-                            // Metadata only — PNG lives in Images, never embedded in text.
                             var meta = new
                             {
                                 source = result.Source,
-                                format = result.Format,
+                                format = result.Format ?? "png",
                                 width = result.Width,
                                 height = result.Height,
                                 filePath = result.FilePath,
                                 isRealPixels = true,
                                 overlayUiIncluded = result.OverlayUiIncluded,
+                                batch = result.Batch ?? batch,
+                                regionNative = result.RegionNative,
+                                wholeFrameDownscaled = result.WholeFrameDownscaled,
+                                maxResolutionApplied = maxRes,
                                 note = result.Note,
-                                targetId = result.TargetId
+                                targetId = result.TargetId,
+                                mimeType = "image/png",
+                                contentType = "image"
                             };
                             return ToolResult.OkWithImages(
                                 System.Text.Json.JsonSerializer.Serialize(meta, CompactResults.JsonOptions),
@@ -313,13 +359,19 @@ public static class DomainSkills
                                 structured: meta);
                         }
 
-                        return ToolResult.Error(
+                        return ToolResult.ErrorEnvelope(
+                            "no_live_pixels",
                             result.Note
-                            ?? "No real pixels available. Load a live Unity Editor with the Unity-Comdr bridge and ensure a camera or Scene View exists.");
+                            ?? "No real pixels available (no live Editor / no camera / capture failed).",
+                            suggestion: "Vision requires hostMode=live and a capturable view.",
+                            nextStep: "Open Unity with Unity-Comdr bridge; call editor_state and confirm hostMode=live; retry screenshot_capture.");
                     }
                     catch (Exception ex)
                     {
-                        return ToolResult.Error(ex.Message);
+                        return ToolResult.ErrorEnvelope(
+                            "screenshot_failed",
+                            ex.Message,
+                            nextStep: "Fix camera/Scene View/target, or use source=game_view with an open Game View.");
                     }
                 })
         }
@@ -435,4 +487,24 @@ public static class DomainSkills
         string.IsNullOrWhiteSpace(csv)
             ? Array.Empty<string>()
             : csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static bool IsLive(IEditorHost editor) =>
+        string.Equals(editor.HostMode, "live", StringComparison.OrdinalIgnoreCase);
+
+    private static object WrapProfiler(IEditorHost editor)
+    {
+        var s = editor.GetProfilerSnapshot();
+        return new
+        {
+            format = "json-metrics-snapshot",
+            note = "Profiler.Get* memory/FPS counters only — not full Profiler window capture.",
+            hostMode = editor.HostMode,
+            enabled = s.Enabled,
+            deltaTimeMs = s.DeltaTimeMs,
+            fps = s.Fps,
+            monoUsedBytes = s.MonoUsedBytes,
+            totalAllocatedBytes = s.TotalAllocatedBytes,
+            enabledModules = s.EnabledModules
+        };
+    }
 }

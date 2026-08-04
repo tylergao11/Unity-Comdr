@@ -26,21 +26,13 @@ public class SkillSurfaceProductionTests
             Assert.False(load.IsError, $"load {id}: {load.Content}");
         }
 
-        // testing (Coplay-style job: tests_run → jobId/status, tests_status → results)
+        // testing — headless honesty: requires live TestRunnerApi (no fake job success)
         var tests = await rt.Registry.CallAsync("tests_run", Obj(("mode", "EditMode")));
-        Assert.False(tests.IsError);
-        Assert.Contains("jobId", tests.Content);
-        Assert.Contains("status", tests.Content);
-        using (var startDoc = System.Text.Json.JsonDocument.Parse(tests.Content))
-        {
-            var jobId = startDoc.RootElement.GetProperty("data").GetProperty("jobId").GetString();
-            var status = await rt.Registry.CallAsync("tests_status", Obj(("jobId", jobId!)));
-            Assert.False(status.IsError, status.Content);
-            Assert.Contains("results", status.Content);
-        }
+        Assert.True(tests.IsError, "headless tests_run must isError, not fake job");
+        Assert.Contains("requires_live", tests.Content, StringComparison.OrdinalIgnoreCase);
         var testsList = await rt.Registry.CallAsync("tests_list", null);
-        Assert.False(testsList.IsError);
-        Assert.Contains("Console_NoErrors", testsList.Content);
+        Assert.True(testsList.IsError);
+        Assert.Contains("requires_live", testsList.Content, StringComparison.OrdinalIgnoreCase);
 
         // prefab-advanced (need a prefab first)
         await rt.Registry.CallAsync("gameobject_manage", Obj(("action", "create"), ("name", "BatchSrc"), ("primitive", "Cube")));
@@ -70,17 +62,16 @@ public class SkillSurfaceProductionTests
         var selGet = await rt.Registry.CallAsync("selection_manage", Obj(("action", "get")));
         Assert.Contains(cube.Id, selGet.Content);
 
-        // packages — list non-empty, search catalog, add
+        // packages — headless honesty: requires live PackageManager.Client (no fake UPM)
         var pkgList = await rt.Registry.CallAsync("package_manage", Obj(("action", "list")));
-        Assert.False(pkgList.IsError);
-        Assert.Contains("com.unity", pkgList.Content);
-        Assert.DoesNotContain("\"packages\":[]", pkgList.Content.Replace(" ", ""));
+        Assert.True(pkgList.IsError, "headless package list must isError");
+        Assert.Contains("requires_live", pkgList.Content, StringComparison.OrdinalIgnoreCase);
         var pkgSearch = await rt.Registry.CallAsync("package_manage", Obj(("action", "search"), ("query", "cinemachine")));
-        Assert.False(pkgSearch.IsError);
-        Assert.Contains("cinemachine", pkgSearch.Content, StringComparison.OrdinalIgnoreCase);
+        Assert.True(pkgSearch.IsError);
+        Assert.Contains("requires_live", pkgSearch.Content, StringComparison.OrdinalIgnoreCase);
         var pkgAdd = await rt.Registry.CallAsync("package_manage", Obj(("action", "add"), ("package", "com.unity.cinemachine@2.9.7")));
-        Assert.False(pkgAdd.IsError);
-        Assert.Contains("cinemachine", pkgAdd.Content, StringComparison.OrdinalIgnoreCase);
+        Assert.True(pkgAdd.IsError, "headless package add must isError");
+        Assert.Contains("requires_live", pkgAdd.Content, StringComparison.OrdinalIgnoreCase);
 
         // menu — list non-empty + execute side effect
         var menuList = await rt.Registry.CallAsync("menu_manage", Obj(("action", "list")));
@@ -111,7 +102,11 @@ public class SkillSurfaceProductionTests
         var shot = await rt.Registry.CallAsync("screenshot_capture", Obj(("source", "game_view")));
         Assert.True(shot.IsError);
         Assert.DoesNotContain("payloadMarker", shot.Content);
-        Assert.Contains("real pixels", shot.Content, StringComparison.OrdinalIgnoreCase);
+        Assert.True(
+            shot.Content.Contains("real pixels", StringComparison.OrdinalIgnoreCase) ||
+            shot.Content.Contains("no_live_pixels", StringComparison.OrdinalIgnoreCase) ||
+            shot.Content.Contains("no live Editor", StringComparison.OrdinalIgnoreCase),
+            shot.Content);
 
         // batch
         var batch = await rt.Registry.CallAsync("batch_execute", Obj(

@@ -10,6 +10,11 @@ namespace UnityComdr.Editor;
 /// </summary>
 public interface IEditorHost
 {
+    /// <summary>
+    /// <c>live</c> = Unity Editor bridge; <c>headless</c> = InMemory synthetic (not a real project).
+    /// </summary>
+    string HostMode { get; }
+
     // Console
     IReadOnlyList<ConsoleLogEntry> GetConsoleLogs();
     void ClearConsole();
@@ -76,11 +81,16 @@ public interface IEditorHost
     void RefreshAssets();
     IReadOnlyList<string> ListShaders();
 
-    // Package Manager (IvanMurzak / CoderGamester parity)
+    // Package Manager (IvanMurzak / CoderGamester parity) — live uses PackageManager.Client
     IReadOnlyList<PackageInfo> ListPackages();
     PackageInfo AddPackage(string packageIdOrUrl);
     bool RemovePackage(string packageName);
     IReadOnlyList<PackageInfo> SearchPackages(string query);
+
+    // Unity Test Runner (live TestRunnerApi only; headless returns Status=unsupported)
+    TestJobSnapshot StartTests(string mode, string? filter = null);
+    TestJobSnapshot GetTestJob(string jobId);
+    IReadOnlyList<TestCatalogEntry> ListTests(string? mode = null);
 
     // Menu items (CoderGamester execute_menu_item parity)
     IReadOnlyList<MenuItemInfo> ListMenuItems(string? filter = null);
@@ -96,7 +106,8 @@ public interface IEditorHost
         int? regionX = null,
         int? regionY = null,
         int? regionWidth = null,
-        int? regionHeight = null);
+        int? regionHeight = null,
+        string? batch = null);
 
     // Profiler (IvanMurzak parity — headless synthetic)
     ProfilerSnapshot GetProfilerSnapshot();

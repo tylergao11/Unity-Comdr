@@ -39,8 +39,8 @@ public class ParityAndDomainSkillTests
         await Load(rt, DomainSkills.PackagesId);
         var add = await rt.Registry.CallAsync("package_manage", Obj(
             ("action", "add"), ("package", "com.unity.cinemachine@2.9.0")));
-        Assert.False(add.IsError);
-        Assert.Contains("cinemachine", add.Content, StringComparison.OrdinalIgnoreCase);
+        Assert.True(add.IsError, "headless package add must isError (requires live Client API)");
+        Assert.Contains("requires_live", add.Content, StringComparison.OrdinalIgnoreCase);
 
         await Load(rt, DomainSkills.MenuId);
         var menu = await rt.Registry.CallAsync("menu_manage", Obj(
@@ -64,7 +64,11 @@ public class ParityAndDomainSkillTests
         var shot = await rt.Registry.CallAsync("screenshot_capture", Obj(("source", "game_view")));
         Assert.True(shot.IsError);
         Assert.DoesNotContain("payloadMarker", shot.Content);
-        Assert.Contains("real pixels", shot.Content, StringComparison.OrdinalIgnoreCase);
+        Assert.True(
+            shot.Content.Contains("real pixels", StringComparison.OrdinalIgnoreCase) ||
+            shot.Content.Contains("no_live_pixels", StringComparison.OrdinalIgnoreCase) ||
+            shot.Content.Contains("no live Editor", StringComparison.OrdinalIgnoreCase),
+            shot.Content);
 
         await Load(rt, DomainSkills.BatchId);
         var batch = await rt.Registry.CallAsync("batch_execute", Obj(

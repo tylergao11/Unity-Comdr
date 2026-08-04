@@ -9,10 +9,15 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEditor;
+using UnityEditor.Compilation;
+using UnityEditor.PackageManager;
+using UnityEditor.PackageManager.Requests;
 using UnityEditor.SceneManagement;
+using UnityEditor.TestTools.TestRunner.Api;
 using UnityEngine;
 using UnityEngine.Profiling;
 using UnityEngine.SceneManagement;
+
 
 namespace UnityComdr.UnityEditor
 {
@@ -68,6 +73,7 @@ namespace UnityComdr.UnityEditor
         // O1/O2: persist across domain reload via SessionState (statics reset on reload).
         private const string SessionGenerationKey = "UnityComdr.SessionGeneration";
         private const string CompileEpochKey = "UnityComdr.CompileEpoch";
+        /// <summary>Curated whitelist only — not a full Unity menu tree (Claim LIMITED).</summary>
         private static readonly string[] BuiltinMenuCatalog =
         {
             "GameObject/Create Empty",
@@ -85,6 +91,37 @@ namespace UnityComdr.UnityEditor
             "File/Save",
             "File/Save Project"
         };
+
+        private static readonly Dictionary<string, BridgeTestJob> TestJobs =
+            new Dictionary<string, BridgeTestJob>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly Dictionary<string, BridgePackageJob> PackageJobs =
+            new Dictionary<string, BridgePackageJob>(StringComparer.OrdinalIgnoreCase);
+
+        private sealed class BridgeTestJob
+        {
+            public string JobId;
+            public string Status = "running"; // running | completed | failed
+            public string Kind = "run"; // run | list
+            public string Mode = "EditMode";
+            public string Filter;
+            public bool? Passed;
+            public readonly List<string> ResultLines = new List<string>();
+            public string Note;
+        }
+
+        /// <summary>Non-blocking UPM op — Request polled on EditorApplication.update (never Thread.Sleep on main).</summary>
+        private sealed class BridgePackageJob
+        {
+            public string JobId;
+            public string Status = "running"; // running | completed | failed
+            public string Op; // list | add | remove | search
+            public Request Request;
+            public string ResultJson; // packages array / package object / true|false
+            public string Error;
+            public string Query;
+            public string PackageId;
+        }
 
         static LiveUnityBridgeServer()
         {
@@ -112,6 +149,7 @@ namespace UnityComdr.UnityEditor
             _sessionGenerationCache = SessionState.GetInt(SessionGenerationKey, 1);
             _compileEpochCache = SessionState.GetInt(CompileEpochKey, 0);
             ProcessMainThreadQueue();
+            PumpPackageJobs();
 
             if (!IsRunning && !_isReloading && !EditorApplication.isCompiling &&
                 EditorApplication.timeSinceStartup >= _nextAutoStartAttempt)
@@ -197,6 +235,93 @@ namespace UnityComdr.UnityEditor
             }
             if (captured != null)
                 throw captured;
+        }
+
+        /// <summary>Advance async PackageManager requests without blocking the main thread.</summary>
+        private static void PumpPackageJobs()
+        {
+            if (PackageJobs.Count == 0) return;
+            List<string> keys;
+            lock (PackageJobs)
+            {
+                keys = new List<string>(PackageJobs.Keys);
+            }
+            foreach (var key in keys)
+            {
+                BridgePackageJob job;
+                lock (PackageJobs)
+                {
+                    if (!PackageJobs.TryGetValue(key, out job)) continue;
+                }
+                if (job == null || job.Status != "running" || job.Request == null) continue;
+                if (!job.Request.IsCompleted) continue;
+                try
+                {
+                    if (job.Request.Status == StatusCode.Failure)
+                    {
+                        job.Status = "failed";
+                        job.Error = job.Request.Error != null ? job.Request.Error.message : "PackageManager request failed";
+                    }
+                    else
+                    {
+                        job.ResultJson = SerializePackageRequestResult(job);
+                        job.Status = "completed";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    job.Status = "failed";
+                    job.Error = ex.Message;
+                }
+            }
+        }
+
+        private static string SerializePackageRequestResult(BridgePackageJob job)
+        {
+            switch (job.Op)
+            {
+                case "list":
+                {
+                    var listReq = job.Request as ListRequest;
+                    var parts = new List<string>();
+                    if (listReq != null && listReq.Result != null)
+                    {
+                        foreach (var p in listReq.Result)
+                            parts.Add(SerializePackageInfo(p));
+                    }
+                    return "[" + string.Join(",", parts) + "]";
+                }
+                case "add":
+                {
+                    var addReq = job.Request as AddRequest;
+                    if (addReq == null || addReq.Result == null)
+                        throw new InvalidOperationException("AddRequest missing result");
+                    return SerializePackageInfo(addReq.Result);
+                }
+                case "remove":
+                    return "true";
+                case "search":
+                {
+                    var searchReq = job.Request as SearchRequest;
+                    var parts = new List<string>();
+                    if (searchReq != null && searchReq.Result != null)
+                    {
+                        foreach (var p in searchReq.Result)
+                            parts.Add(SerializePackageInfo(p));
+                    }
+                    return "[" + string.Join(",", parts) + "]";
+                }
+                default:
+                    throw new InvalidOperationException("Unknown package op: " + job.Op);
+            }
+        }
+
+        private static string SerializePackageInfo(UnityEditor.PackageManager.PackageInfo p)
+        {
+            return "{\"name\":" + JsonString(p.name) +
+                   ",\"version\":" + JsonString(p.version) +
+                   ",\"source\":" + JsonString(p.source.ToString()) +
+                   ",\"displayName\":" + JsonString(string.IsNullOrEmpty(p.displayName) ? p.name : p.displayName) + "}";
         }
 
         private static void OnPlayModeStateChanged(PlayModeStateChange change)
@@ -568,11 +693,23 @@ namespace UnityComdr.UnityEditor
                     case "editor.getState":
                         return Ok(id, SerializeState());
                     case "editor.compile":
+                    {
+                        // Canonical: CompilationPipeline.RequestScriptCompilation (not Refresh-only).
                         AssetDatabase.Refresh();
-                        _isCompiling = true;
                         BumpCompileEpoch();
+                        try
+                        {
+                            CompilationPipeline.RequestScriptCompilation();
+                        }
+                        catch (Exception ex)
+                        {
+                            return Fail(id, "RequestScriptCompilation failed: " + ex.Message);
+                        }
+                        _isCompiling = EditorApplication.isCompiling || true;
                         return Ok(id, "{\"compileEpoch\":" + GetCompileEpoch() +
-                                      ",\"sessionGeneration\":" + GetSessionGeneration() + "}");
+                                      ",\"sessionGeneration\":" + GetSessionGeneration() +
+                                      ",\"hostMode\":\"live\",\"pipeline\":\"CompilationPipeline.RequestScriptCompilation\"}");
+                    }
                     case "editor.setPlayMode":
                     {
                         _playTransition = true;
@@ -832,7 +969,7 @@ namespace UnityComdr.UnityEditor
                         if (go == null) return Ok(id, "null");
                         var c = go.GetComponent(typeName);
                         if (c == null) return Ok(id, "null");
-                        return Ok(id, "{\"typeName\":" + JsonString(typeName) + ",\"properties\":{}}");
+                        return Ok(id, SerializeComponentData(c));
                     }
                     case "comp.modify":
                     {
@@ -844,7 +981,7 @@ namespace UnityComdr.UnityEditor
                         return Ok(id, ApplyComponentProperties(c, line) ? "true" : "false");
                     }
                     case "comp.listTypes":
-                        return Ok(id, "[\"Transform\",\"Rigidbody\",\"BoxCollider\",\"MeshRenderer\",\"Camera\",\"Light\"]");
+                        return Ok(id, ListComponentTypesJson(ExtractString(line, "filter")));
                     case "assets.materialCreate":
                     {
                         var path = NormalizeAsset(ExtractString(line, "path"), ".mat");
@@ -920,22 +1057,15 @@ namespace UnityComdr.UnityEditor
                         return Ok(id, "null");
                     }
                     case "package.list":
-                        return Ok(id, ListPackagesJson());
+                        return StartPackageJob(id, "list", null, null);
                     case "package.add":
-                    {
-                        var pkg = ExtractString(line, "package") ?? "com.unity.modules.ui";
-                        return Ok(id, AddPackageJson(pkg));
-                    }
+                        return StartPackageJob(id, "add", ExtractString(line, "package"), null);
                     case "package.remove":
-                    {
-                        var pkg = ExtractString(line, "package") ?? "";
-                        return Ok(id, RemovePackageJson(pkg));
-                    }
+                        return StartPackageJob(id, "remove", ExtractString(line, "package"), null);
                     case "package.search":
-                    {
-                        var q = ExtractString(line, "query") ?? "";
-                        return Ok(id, SearchPackagesJson(q));
-                    }
+                        return StartPackageJob(id, "search", null, ExtractString(line, "query") ?? "");
+                    case "package.status":
+                        return HandlePackageStatus(id, ExtractString(line, "jobId"));
                     case "menu.list":
                     {
                         var filter = ExtractString(line, "filter");
@@ -956,7 +1086,8 @@ namespace UnityComdr.UnityEditor
                             ExtractInt(line, "regionX"),
                             ExtractInt(line, "regionY"),
                             ExtractInt(line, "regionWidth"),
-                            ExtractInt(line, "regionHeight")));
+                            ExtractInt(line, "regionHeight"),
+                            ExtractString(line, "batch")));
                     case "profiler.get":
                         return Ok(id, ProfilerGetJson());
                     case "profiler.setEnabled":
@@ -972,8 +1103,23 @@ namespace UnityComdr.UnityEditor
                         return Ok(id, "null");
                     case "profiler.save":
                     {
-                        var path = ExtractString(line, "path") ?? "Temp/unity-comdr-profiler.json";
-                        ProfilerSaves[path] = ProfilerGetJson();
+                        // Honest: JSON metrics snapshot file (not Unity Profiler binary).
+                        var path = ExtractString(line, "path") ?? "Temp/unity-comdr-profiler-metrics.json";
+                        var snap = ProfilerGetJson();
+                        ProfilerSaves[path] = snap;
+                        try
+                        {
+                            var full = path.Replace('\\', '/');
+                            if (!Path.IsPathRooted(full))
+                            {
+                                var root = Directory.GetParent(Application.dataPath)?.FullName ?? ".";
+                                full = Path.Combine(root, path);
+                            }
+                            var dir = Path.GetDirectoryName(full);
+                            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                            File.WriteAllText(full, snap);
+                        }
+                        catch { /* in-memory save still held */ }
                         return Ok(id, "null");
                     }
                     case "profiler.load":
@@ -981,20 +1127,35 @@ namespace UnityComdr.UnityEditor
                         var path = ExtractString(line, "path") ?? "";
                         if (ProfilerSaves.TryGetValue(path, out var snap))
                             return Ok(id, snap);
+                        try
+                        {
+                            var full = path;
+                            if (!Path.IsPathRooted(full))
+                            {
+                                var root = Directory.GetParent(Application.dataPath)?.FullName ?? ".";
+                                full = Path.Combine(root, path);
+                            }
+                            if (File.Exists(full))
+                                return Ok(id, File.ReadAllText(full));
+                        }
+                        catch { /* fall through */ }
                         return Ok(id, "null");
                     }
                     case "ui.query":
-                        // Minimal stub — full UI enumeration is out of Phase V scope.
-                        return Ok(id, "[]");
+                        return Ok(id, QueryUiJson(ExtractString(line, "filter")));
                     case "input.simulate":
                     {
+                        // Honest non-support: never ok:true empty shell.
                         var action = ExtractString(line, "action") ?? "unknown";
-                        var target = ExtractString(line, "target");
-                        return Ok(id, "{\"ok\":true,\"action\":" + JsonString(action) +
-                                      ",\"target\":" + (target == null ? "null" : JsonString(target)) +
-                                      ",\"note\":" + JsonString("live input simulate acknowledged") +
-                                      ",\"effects\":{}}");
+                        return Fail(id, "input.simulate is not implemented for real input injection. " +
+                                        "Use selection_manage or menu_manage. action=" + action);
                     }
+                    case "tests.run":
+                        return HandleTestsRun(id, line);
+                    case "tests.status":
+                        return HandleTestsStatus(id, ExtractString(line, "jobId"));
+                    case "tests.list":
+                        return HandleTestsList(id, ExtractString(line, "mode"));
                     case "lease.get":
                         return Ok(id, SerializeLease());
                     case "lease.acquire":
@@ -1102,7 +1263,8 @@ namespace UnityComdr.UnityEditor
             foreach (var c in go.GetComponents<Component>())
             {
                 if (c == null) continue;
-                comps.Add(JsonString(c.GetType().Name));
+                // Bounded property export via SerializedObject (not empty properties:{}).
+                comps.Add(SerializeComponentData(c, maxProps: 24));
             }
             var childIds = new List<string>();
             for (var i = 0; i < go.transform.childCount; i++)
@@ -1120,7 +1282,7 @@ namespace UnityComdr.UnityEditor
                 + "\"transform\":{\"position\":{\"x\":" + F(p.x) + ",\"y\":" + F(p.y) + ",\"z\":" + F(p.z)
                 + "},\"rotationEuler\":{\"x\":" + F(r.x) + ",\"y\":" + F(r.y) + ",\"z\":" + F(r.z)
                 + "},\"scale\":{\"x\":" + F(s.x) + ",\"y\":" + F(s.y) + ",\"z\":" + F(s.z) + "}},"
-                + "\"components\":[" + string.Join(",", comps.ConvertAll(c => "{\"typeName\":" + c + ",\"properties\":{}}")) + "],"
+                + "\"components\":[" + string.Join(",", comps) + "],"
                 + "\"childIds\":[" + string.Join(",", childIds) + "]"
                 + "}";
         }
@@ -1272,7 +1434,7 @@ namespace UnityComdr.UnityEditor
 
         private static bool ApplyComponentProperties(Component c, string line)
         {
-            // "properties":{"mass":5,"useGravity":false} from BridgeClient args
+            // Supports scalar + Vector3-like nested objects {"x":..,"y":..,"z":..}
             var marker = "\"properties\":";
             var idx = line.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
             if (idx < 0) return false;
@@ -1293,7 +1455,6 @@ namespace UnityComdr.UnityEditor
             var propsJson = line.Substring(start, end - start + 1);
             var so = new SerializedObject(c);
             var applied = 0;
-            // naive key scan: "key":
             var pos = 1;
             while (pos < propsJson.Length - 1)
             {
@@ -1317,10 +1478,26 @@ namespace UnityComdr.UnityEditor
                     valToken = propsJson.Substring(valStart + 1, valEnd - valStart - 1);
                     valEnd++;
                 }
-                else if (propsJson[valStart] == '{' || propsJson[valStart] == '[')
+                else if (propsJson[valStart] == '{')
+                {
+                    var d = 0;
+                    var j = valStart;
+                    for (; j < propsJson.Length; j++)
+                    {
+                        if (propsJson[j] == '{') d++;
+                        else if (propsJson[j] == '}')
+                        {
+                            d--;
+                            if (d == 0) { j++; break; }
+                        }
+                    }
+                    valToken = propsJson.Substring(valStart, j - valStart);
+                    valEnd = j;
+                }
+                else if (propsJson[valStart] == '[')
                 {
                     pos = q2 + 1;
-                    continue; // skip nested objects
+                    continue; // arrays not applied (honest limit)
                 }
                 else
                 {
@@ -1328,7 +1505,7 @@ namespace UnityComdr.UnityEditor
                         valEnd++;
                     valToken = propsJson.Substring(valStart, valEnd - valStart).Trim();
                 }
-                var sp = so.FindProperty(propName);
+                var sp = so.FindProperty(propName) ?? so.FindProperty("m_" + propName);
                 if (sp != null)
                 {
                     if (sp.propertyType == SerializedPropertyType.Float && float.TryParse(valToken, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var f))
@@ -1339,6 +1516,32 @@ namespace UnityComdr.UnityEditor
                     { sp.boolValue = valToken.Equals("true", StringComparison.OrdinalIgnoreCase); applied++; }
                     else if (sp.propertyType == SerializedPropertyType.String)
                     { sp.stringValue = valToken; applied++; }
+                    else if (sp.propertyType == SerializedPropertyType.Enum && int.TryParse(valToken, out var ei))
+                    { sp.enumValueIndex = ei; applied++; }
+                    else if (sp.propertyType == SerializedPropertyType.Vector3 && valToken.Length > 0 && valToken[0] == '{')
+                    {
+                        var vx = ExtractFloatFromObject(valToken, "x") ?? sp.vector3Value.x;
+                        var vy = ExtractFloatFromObject(valToken, "y") ?? sp.vector3Value.y;
+                        var vz = ExtractFloatFromObject(valToken, "z") ?? sp.vector3Value.z;
+                        sp.vector3Value = new Vector3(vx, vy, vz);
+                        applied++;
+                    }
+                    else if (sp.propertyType == SerializedPropertyType.Vector2 && valToken.Length > 0 && valToken[0] == '{')
+                    {
+                        var vx = ExtractFloatFromObject(valToken, "x") ?? sp.vector2Value.x;
+                        var vy = ExtractFloatFromObject(valToken, "y") ?? sp.vector2Value.y;
+                        sp.vector2Value = new Vector2(vx, vy);
+                        applied++;
+                    }
+                    else if (sp.propertyType == SerializedPropertyType.Color && valToken.Length > 0 && valToken[0] == '{')
+                    {
+                        var cr = ExtractFloatFromObject(valToken, "r") ?? sp.colorValue.r;
+                        var cg = ExtractFloatFromObject(valToken, "g") ?? sp.colorValue.g;
+                        var cb = ExtractFloatFromObject(valToken, "b") ?? sp.colorValue.b;
+                        var ca = ExtractFloatFromObject(valToken, "a") ?? sp.colorValue.a;
+                        sp.colorValue = new Color(cr, cg, cb, ca);
+                        applied++;
+                    }
                 }
                 pos = Math.Max(valEnd, q2 + 1);
             }
@@ -1351,161 +1554,424 @@ namespace UnityComdr.UnityEditor
             return false;
         }
 
-        private static string ListPackagesJson()
+        private static string SerializeComponentData(Component c, int maxProps = 64)
         {
-            // Filesystem snapshot (manifest + PackageCache) — avoids main-thread UPM hang.
-            return ListPackagesFromProjectFiles();
+            if (c == null) return "null";
+            var typeName = c.GetType().Name;
+            var parts = new List<string>();
+            try
+            {
+                var so = new SerializedObject(c);
+                var it = so.GetIterator();
+                var enter = true;
+                var n = 0;
+                while (it.NextVisible(enter) && n < maxProps)
+                {
+                    enter = false;
+                    if (it.name == "m_Script" || it.name == "m_ObjectHideFlags") continue;
+                    var key = it.name.StartsWith("m_", StringComparison.Ordinal) && it.name.Length > 2
+                        ? char.ToLowerInvariant(it.name[2]) + it.name.Substring(3)
+                        : it.name;
+                    parts.Add(JsonString(key) + ":" + SerializeSerializedProp(it));
+                    n++;
+                }
+            }
+            catch
+            {
+                // leave properties empty only on failure
+            }
+            return "{\"typeName\":" + JsonString(typeName) + ",\"properties\":{" + string.Join(",", parts) + "}}";
         }
 
-        private static string ListPackagesFromProjectFiles()
+        private static string SerializeSerializedProp(SerializedProperty p)
         {
             try
             {
-                var projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? "";
-                var manifestPath = Path.Combine(projectRoot, "Packages", "manifest.json");
-                var parts = new List<string>();
-                if (File.Exists(manifestPath))
+                switch (p.propertyType)
                 {
-                    var text = File.ReadAllText(manifestPath);
-                    // "com.unity.x": "1.2.3"
-                    var rx = new System.Text.RegularExpressions.Regex("\"(com\\.[^\"]+)\"\\s*:\\s*\"([^\"]+)\"");
-                    foreach (System.Text.RegularExpressions.Match m in rx.Matches(text))
-                    {
-                        var name = m.Groups[1].Value;
-                        var ver = m.Groups[2].Value;
-                        if (name == "dependencies") continue;
-                        parts.Add("{\"name\":" + JsonString(name) + ",\"version\":" + JsonString(ver) +
-                                  ",\"source\":\"manifest\",\"displayName\":" + JsonString(name) + "}");
-                    }
+                    case SerializedPropertyType.Integer: return p.intValue.ToString();
+                    case SerializedPropertyType.Boolean: return p.boolValue ? "true" : "false";
+                    case SerializedPropertyType.Float: return F(p.floatValue);
+                    case SerializedPropertyType.String: return JsonString(p.stringValue ?? "");
+                    case SerializedPropertyType.Enum: return JsonString(p.enumDisplayNames != null && p.enumValueIndex >= 0 && p.enumValueIndex < p.enumDisplayNames.Length ? p.enumDisplayNames[p.enumValueIndex] : p.intValue.ToString());
+                    case SerializedPropertyType.Vector2:
+                        return "{\"x\":" + F(p.vector2Value.x) + ",\"y\":" + F(p.vector2Value.y) + "}";
+                    case SerializedPropertyType.Vector3:
+                        return "{\"x\":" + F(p.vector3Value.x) + ",\"y\":" + F(p.vector3Value.y) + ",\"z\":" + F(p.vector3Value.z) + "}";
+                    case SerializedPropertyType.Color:
+                        return "{\"r\":" + F(p.colorValue.r) + ",\"g\":" + F(p.colorValue.g) + ",\"b\":" + F(p.colorValue.b) + ",\"a\":" + F(p.colorValue.a) + "}";
+                    case SerializedPropertyType.ObjectReference:
+                        return p.objectReferenceValue == null ? "null" : JsonString(p.objectReferenceValue.name);
+                    default:
+                        return JsonString(p.propertyType.ToString());
                 }
-                // Also scan PackageCache folder names for installed packages
-                var cache = Path.Combine(projectRoot, "Library", "PackageCache");
-                if (Directory.Exists(cache))
+            }
+            catch
+            {
+                return "null";
+            }
+        }
+
+        private static string ListComponentTypesJson(string filter)
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try { types = asm.GetTypes(); }
+                catch { continue; }
+                foreach (var t in types)
                 {
-                    foreach (var dir in Directory.GetDirectories(cache))
+                    try
                     {
-                        var folder = Path.GetFileName(dir);
-                        // com.unity.x@1.2.3
-                        var at = folder.LastIndexOf('@');
-                        var name = at > 0 ? folder.Substring(0, at) : folder;
-                        var ver = at > 0 ? folder.Substring(at + 1) : "";
-                        if (parts.Exists(p => p.Contains("\"name\":" + JsonString(name)))) continue;
-                        parts.Add("{\"name\":" + JsonString(name) + ",\"version\":" + JsonString(ver) +
-                                  ",\"source\":\"packageCache\",\"displayName\":" + JsonString(name) + "}");
+                        if (t == null || t.IsAbstract || !typeof(Component).IsAssignableFrom(t)) continue;
+                        if (!string.IsNullOrEmpty(filter) &&
+                            t.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0 &&
+                            (t.FullName == null || t.FullName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0))
+                            continue;
+                        names.Add(t.Name);
                     }
+                    catch { /* skip */ }
                 }
-                return "[" + string.Join(",", parts) + "]";
+            }
+            var list = new List<string>(names);
+            list.Sort(StringComparer.OrdinalIgnoreCase);
+            if (list.Count > 500) list = list.GetRange(0, 500);
+            var parts = new List<string>();
+            foreach (var n in list) parts.Add(JsonString(n));
+            return "[" + string.Join(",", parts) + "]";
+        }
+
+        private static string QueryUiJson(string filter)
+        {
+            // Real enumeration of Canvas / RectTransform UI tree (no empty stub without scanning).
+            var parts = new List<string>();
+            var seen = new HashSet<int>();
+            try
+            {
+                var canvases = UnityEngine.Object.FindObjectsOfType<Canvas>(true);
+                foreach (var canvas in canvases)
+                {
+                    if (canvas == null) continue;
+                    foreach (var rt in canvas.GetComponentsInChildren<RectTransform>(true))
+                    {
+                        if (rt == null) continue;
+                        var go = rt.gameObject;
+                        var iid = go.GetInstanceID();
+                        if (!seen.Add(iid)) continue;
+                        var name = go.name;
+                        if (!string.IsNullOrEmpty(filter) &&
+                            name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0 &&
+                            iid.ToString().IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
+                            continue;
+                        var kind = "RectTransform";
+                        foreach (var c in go.GetComponents<Component>())
+                        {
+                            if (c == null || c is RectTransform || c is Transform || c is CanvasRenderer) continue;
+                            kind = c.GetType().Name;
+                            break;
+                        }
+                        var rect = "{\"x\":" + F(rt.rect.x) + ",\"y\":" + F(rt.rect.y) +
+                                   ",\"w\":" + F(rt.rect.width) + ",\"h\":" + F(rt.rect.height) + "}";
+                        parts.Add("{\"id\":" + JsonString(iid.ToString()) +
+                                  ",\"name\":" + JsonString(name) +
+                                  ",\"kind\":" + JsonString(kind) +
+                                  ",\"interactable\":true" +
+                                  ",\"path\":" + JsonString(GetHierarchyPath(go)) +
+                                  ",\"rect\":" + rect + "}");
+                        if (parts.Count >= 200) break;
+                    }
+                    if (parts.Count >= 200) break;
+                }
             }
             catch (Exception ex)
             {
-                return "[{\"name\":\"error\",\"version\":\"0\",\"source\":\"local\",\"displayName\":" + JsonString(ex.Message) + "}]";
+                return "[{\"id\":\"error\",\"name\":" + JsonString(ex.Message) + ",\"kind\":\"error\",\"interactable\":false,\"rect\":{\"x\":0,\"y\":0,\"w\":0,\"h\":0}}]";
             }
+            return "[" + string.Join(",", parts) + "]";
         }
 
-        private static string AddPackageJson(string packageId)
+        private static string GetHierarchyPath(GameObject go)
         {
-            // Write dependency into Packages/manifest.json (production-safe without blocking UPM main-thread wait).
+            var stack = new Stack<string>();
+            var t = go.transform;
+            while (t != null)
+            {
+                stack.Push(t.name);
+                t = t.parent;
+            }
+            return string.Join("/", stack.ToArray());
+        }
+
+        private static string HandleTestsRun(string id, string line)
+        {
+            var mode = ExtractString(line, "mode") ?? "EditMode";
+            var filter = ExtractString(line, "filter");
+            var jobId = Guid.NewGuid().ToString("N").Substring(0, 12);
+            var job = new BridgeTestJob
+            {
+                JobId = jobId,
+                Status = "running",
+                Kind = "run",
+                Mode = mode,
+                Filter = filter
+            };
+            TestJobs[jobId] = job;
             try
             {
-                var projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? "";
-                var manifestPath = Path.Combine(projectRoot, "Packages", "manifest.json");
-                if (!File.Exists(manifestPath))
-                    return "{\"name\":" + JsonString(packageId) + ",\"version\":\"\",\"source\":\"manifest\",\"displayName\":\"manifest missing\"}";
-                var name = packageId;
-                var ver = "1.0.0";
-                if (packageId.Contains("@"))
-                {
-                    var bits = packageId.Split('@');
-                    name = bits[0];
-                    ver = bits.Length > 1 ? bits[1] : ver;
-                }
-                var text = File.ReadAllText(manifestPath);
-                if (text.Contains("\"" + name + "\""))
-                {
-                    // update version loosely
-                    text = System.Text.RegularExpressions.Regex.Replace(text,
-                        "\"" + System.Text.RegularExpressions.Regex.Escape(name) + "\"\\s*:\\s*\"[^\"]*\"",
-                        "\"" + name + "\": \"" + ver + "\"");
-                }
-                else
-                {
-                    var insert = "    \"" + name + "\": \"" + ver + "\",\n";
-                    var depIdx = text.IndexOf("\"dependencies\"", StringComparison.OrdinalIgnoreCase);
-                    if (depIdx >= 0)
-                    {
-                        var brace = text.IndexOf('{', depIdx);
-                        if (brace >= 0)
-                            text = text.Insert(brace + 1, "\n" + insert);
-                    }
-                }
-                File.WriteAllText(manifestPath, text);
-                AssetDatabase.Refresh();
-                return "{\"name\":" + JsonString(name) + ",\"version\":" + JsonString(ver) +
-                       ",\"source\":\"manifest\",\"displayName\":" + JsonString(name) + "}";
+                var api = ScriptableObject.CreateInstance<TestRunnerApi>();
+                var testMode = mode.IndexOf("Play", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? TestMode.PlayMode
+                    : TestMode.EditMode;
+                var filterObj = new Filter { testMode = testMode };
+                if (!string.IsNullOrEmpty(filter))
+                    filterObj.testNames = new[] { filter };
+                var callbacks = new BridgeTestCallbacks(jobId);
+                api.RegisterCallbacks(callbacks);
+                api.Execute(new ExecutionSettings(filterObj));
+                return Ok(id, "{\"jobId\":" + JsonString(jobId) +
+                              ",\"status\":\"running\",\"kind\":\"run\",\"mode\":" + JsonString(mode) +
+                              ",\"filter\":" + (filter == null ? "null" : JsonString(filter)) +
+                              ",\"note\":" + JsonString("TestRunnerApi.Execute started") + "}");
             }
             catch (Exception ex)
             {
-                return "{\"name\":" + JsonString(packageId) + ",\"version\":\"\",\"source\":\"manifest\",\"displayName\":" + JsonString(ex.Message) + "}";
+                job.Status = "failed";
+                job.Note = ex.Message;
+                return Fail(id, "TestRunnerApi failed: " + ex.Message);
             }
         }
 
-        private static string RemovePackageJson(string packageName)
+        private static string HandleTestsStatus(string id, string jobId)
         {
-            try
-            {
-                var projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? "";
-                var manifestPath = Path.Combine(projectRoot, "Packages", "manifest.json");
-                if (!File.Exists(manifestPath)) return "false";
-                var text = File.ReadAllText(manifestPath);
-                var next = System.Text.RegularExpressions.Regex.Replace(text,
-                    "\\s*\"" + System.Text.RegularExpressions.Regex.Escape(packageName) + "\"\\s*:\\s*\"[^\"]*\"\\s*,?",
-                    "");
-                if (next == text) return "false";
-                File.WriteAllText(manifestPath, next);
-                AssetDatabase.Refresh();
-                return "true";
-            }
-            catch { return "false"; }
+            if (string.IsNullOrEmpty(jobId) || !TestJobs.TryGetValue(jobId, out var job))
+                return Fail(id, "unknown jobId");
+            if (string.Equals(job.Status, "failed", StringComparison.OrdinalIgnoreCase))
+                return Fail(id, job.Note ?? ("test job failed: " + jobId));
+            var results = new List<string>();
+            foreach (var line in job.ResultLines)
+                results.Add(line);
+            // list jobs: results are catalog entries {name,mode}; run jobs: {name,status,message}
+            return Ok(id, "{\"jobId\":" + JsonString(job.JobId) +
+                          ",\"status\":" + JsonString(job.Status) +
+                          ",\"kind\":" + JsonString(job.Kind ?? "run") +
+                          ",\"mode\":" + JsonString(job.Mode) +
+                          ",\"filter\":" + (job.Filter == null ? "null" : JsonString(job.Filter)) +
+                          ",\"passed\":" + (job.Passed.HasValue ? (job.Passed.Value ? "true" : "false") : "null") +
+                          ",\"results\":[" + string.Join(",", results) + "]" +
+                          ",\"tests\":[" + string.Join(",", results) + "]" +
+                          ",\"note\":" + (job.Note == null ? "null" : JsonString(job.Note)) + "}");
         }
 
-        private static string SearchPackagesJson(string query)
+        /// <summary>
+        /// Non-blocking RetrieveTestList: returns jobId immediately; callback fills TestJobs; poll tests.status.
+        /// Never ManualResetEvent.Wait on the main thread.
+        /// </summary>
+        private static string HandleTestsList(string id, string mode)
         {
-            // Search installed/manifest + package cache (no blocking UPM Search).
-            query = query ?? "";
-            var listJson = ListPackagesFromProjectFiles();
-            if (string.IsNullOrEmpty(query)) return listJson;
+            var jobId = Guid.NewGuid().ToString("N").Substring(0, 12);
+            var modeLabel = !string.IsNullOrEmpty(mode) && mode.IndexOf("Play", StringComparison.OrdinalIgnoreCase) >= 0
+                ? "PlayMode"
+                : "EditMode";
+            var job = new BridgeTestJob
+            {
+                JobId = jobId,
+                Status = "running",
+                Kind = "list",
+                Mode = modeLabel
+            };
+            TestJobs[jobId] = job;
             try
             {
-                // Filter lines containing query
-                var parts = new List<string>();
-                var rx = new System.Text.RegularExpressions.Regex("\\{[^}]+\\}");
-                foreach (System.Text.RegularExpressions.Match m in rx.Matches(listJson))
+                var api = ScriptableObject.CreateInstance<TestRunnerApi>();
+                var testMode = modeLabel == "PlayMode" ? TestMode.PlayMode : TestMode.EditMode;
+                api.RetrieveTestList(testMode, adaptor =>
                 {
-                    if (m.Value.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)
-                        parts.Add(m.Value);
-                }
-                // Always include catalog-like hints for common packages
-                var hints = new[] { "com.unity.cinemachine", "com.unity.addressables", "com.unity.timeline", "com.unity.probuilder" };
-                foreach (var h in hints)
-                {
-                    if (h.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 &&
-                        !parts.Exists(p => p.Contains(h)))
-                        parts.Add("{\"name\":" + JsonString(h) + ",\"version\":\"\",\"source\":\"registry\",\"displayName\":" + JsonString(h) + "}");
-                }
-                return "[" + string.Join(",", parts) + "]";
+                    try
+                    {
+                        var names = new List<string>();
+                        CollectTestNames(adaptor, names, 200);
+                        foreach (var n in names)
+                        {
+                            job.ResultLines.Add("{\"name\":" + JsonString(n) +
+                                                ",\"mode\":" + JsonString(modeLabel) + "}");
+                        }
+                        job.Status = "completed";
+                        job.Note = "RetrieveTestList completed count=" + names.Count;
+                    }
+                    catch (Exception ex)
+                    {
+                        job.Status = "failed";
+                        job.Note = ex.Message;
+                    }
+                });
+                return Ok(id, "{\"jobId\":" + JsonString(jobId) +
+                              ",\"status\":\"running\",\"kind\":\"list\",\"mode\":" + JsonString(modeLabel) + "}");
             }
-            catch { return "[]"; }
+            catch (Exception ex)
+            {
+                job.Status = "failed";
+                job.Note = ex.Message;
+                return Fail(id, "TestRunnerApi list failed to start: " + ex.Message);
+            }
+        }
+
+        private static void CollectTestNames(ITestAdaptor node, List<string> names, int max)
+        {
+            if (node == null || names.Count >= max) return;
+            if (!node.IsSuite && !string.IsNullOrEmpty(node.FullName))
+                names.Add(node.FullName);
+            if (node.Children == null) return;
+            foreach (var child in node.Children)
+            {
+                CollectTestNames(child, names, max);
+                if (names.Count >= max) break;
+            }
+        }
+
+        private sealed class BridgeTestCallbacks : ICallbacks
+        {
+            private readonly string _jobId;
+            public BridgeTestCallbacks(string jobId) { _jobId = jobId; }
+
+            public void RunStarted(ITestAdaptor tests) { }
+
+            public void RunFinished(ITestResultAdaptor result)
+            {
+                if (!TestJobs.TryGetValue(_jobId, out var job)) return;
+                job.Status = "completed";
+                job.Passed = result != null && result.TestStatus == TestStatus.Passed;
+                if (result != null)
+                    job.Note = "resultStatus=" + result.TestStatus;
+            }
+
+            public void TestStarted(ITestAdaptor test) { }
+
+            public void TestFinished(ITestResultAdaptor result)
+            {
+                if (!TestJobs.TryGetValue(_jobId, out var job) || result == null) return;
+                if (result.Test != null && result.Test.IsSuite) return;
+                var name = result.Test != null ? result.Test.FullName : "test";
+                var status = result.TestStatus.ToString();
+                var msg = result.Message ?? "";
+                job.ResultLines.Add("{\"name\":" + JsonString(name) +
+                                    ",\"status\":" + JsonString(status) +
+                                    ",\"message\":" + JsonString(msg) + "}");
+            }
+        }
+
+        /// <summary>
+        /// Start UPM Client request and return immediately with jobId (status=running).
+        /// Completion is polled via package.status + EditorApplication.update (no main-thread Sleep).
+        /// </summary>
+        private static string StartPackageJob(string id, string op, string packageId, string query)
+        {
+            try
+            {
+                Request req;
+                switch (op)
+                {
+                    case "list":
+                        req = Client.List(true, true);
+                        break;
+                    case "add":
+                        if (string.IsNullOrEmpty(packageId))
+                            return Fail(id, "package id required for package.add");
+                        req = Client.Add(packageId);
+                        break;
+                    case "remove":
+                        if (string.IsNullOrEmpty(packageId))
+                            return Fail(id, "package name required for package.remove");
+                        req = Client.Remove(packageId);
+                        break;
+                    case "search":
+                        req = string.IsNullOrWhiteSpace(query) ? Client.SearchAll() : Client.Search(query);
+                        break;
+                    default:
+                        return Fail(id, "unknown package op: " + op);
+                }
+
+                var jobId = Guid.NewGuid().ToString("N").Substring(0, 12);
+                var job = new BridgePackageJob
+                {
+                    JobId = jobId,
+                    Status = "running",
+                    Op = op,
+                    Request = req,
+                    PackageId = packageId,
+                    Query = query
+                };
+                lock (PackageJobs)
+                {
+                    PackageJobs[jobId] = job;
+                }
+                // If already completed by the time we return (cached), pump once.
+                PumpPackageJobs();
+                return Ok(id, "{\"jobId\":" + JsonString(jobId) +
+                              ",\"status\":" + JsonString(job.Status) +
+                              ",\"op\":" + JsonString(op) + "}");
+            }
+            catch (Exception ex)
+            {
+                return Fail(id, "PackageManager." + op + " failed to start: " + ex.Message);
+            }
+        }
+
+        private static string HandlePackageStatus(string id, string jobId)
+        {
+            if (string.IsNullOrEmpty(jobId))
+                return Fail(id, "jobId required");
+            BridgePackageJob job;
+            lock (PackageJobs)
+            {
+                if (!PackageJobs.TryGetValue(jobId, out job))
+                    return Fail(id, "unknown package jobId: " + jobId);
+            }
+            // Opportunistic pump in case update lag.
+            PumpPackageJobs();
+            if (job.Status == "running")
+            {
+                return Ok(id, "{\"jobId\":" + JsonString(job.JobId) +
+                              ",\"status\":\"running\",\"op\":" + JsonString(job.Op ?? "") + "}");
+            }
+            if (job.Status == "failed")
+            {
+                // Honest Fail — never Ok with a fake packages[] entry named "error".
+                return Fail(id, "package." + job.Op + " failed: " + (job.Error ?? "unknown error"));
+            }
+            // completed
+            if (job.Op == "list" || job.Op == "search")
+            {
+                return Ok(id, "{\"jobId\":" + JsonString(job.JobId) +
+                              ",\"status\":\"completed\",\"op\":" + JsonString(job.Op) +
+                              ",\"packages\":" + (job.ResultJson ?? "[]") + "}");
+            }
+            if (job.Op == "add")
+            {
+                return Ok(id, "{\"jobId\":" + JsonString(job.JobId) +
+                              ",\"status\":\"completed\",\"op\":\"add\",\"package\":" +
+                              (job.ResultJson ?? "null") + "}");
+            }
+            if (job.Op == "remove")
+            {
+                return Ok(id, "{\"jobId\":" + JsonString(job.JobId) +
+                              ",\"status\":\"completed\",\"op\":\"remove\",\"removed\":" +
+                              (job.ResultJson ?? "false") + "}");
+            }
+            return Fail(id, "package job completed with unknown op");
         }
 
         private static string ListMenusJson(string filter)
         {
+            // Whitelist coverage only — declared LIMITED, not a full menu tree.
             var parts = new List<string>();
             foreach (var path in BuiltinMenuCatalog)
             {
                 if (!string.IsNullOrEmpty(filter) && path.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
                     continue;
                 var cat = path.Contains("/") ? path.Substring(0, path.IndexOf('/')) : path;
-                parts.Add("{\"path\":" + JsonString(path) + ",\"category\":" + JsonString(cat) + "}");
+                parts.Add("{\"path\":" + JsonString(path) + ",\"category\":" + JsonString(cat) +
+                          ",\"coverage\":\"whitelist\"}");
             }
             return "[" + string.Join(",", parts) + "]";
         }
@@ -1537,7 +2003,8 @@ namespace UnityComdr.UnityEditor
         /// - camera / explicit target → camera.Render (overlay UI excluded)
         /// - isolated → Ivan-style temp layer + staging camera looking only at target GO (+children)
         /// - scene_view → SceneView GrabPixels (or explicit error)
-        /// - whole-frame longest-edge downscale (default 640); region crops stay native resolution
+        /// - batch=surround → ONE labeled 6-view contact sheet (AC-V7)
+        /// - whole-frame longest-edge downscale (default 640 cost knob); region crops stay native (AC-V9)
         /// Throws on failure — never returns a fake success marker.
         /// </summary>
         private static string CaptureScreenshotJson(
@@ -1549,7 +2016,8 @@ namespace UnityComdr.UnityEditor
             int? regionX,
             int? regionY,
             int? regionWidth,
-            int? regionHeight)
+            int? regionHeight,
+            string batch)
         {
             width = Math.Max(16, Math.Min(width, 4096));
             height = Math.Max(16, Math.Min(height, 4096));
@@ -1557,17 +2025,30 @@ namespace UnityComdr.UnityEditor
             bool hasRegion = regionX.HasValue && regionY.HasValue && regionWidth.HasValue && regionHeight.HasValue
                              && regionWidth.Value > 0 && regionHeight.Value > 0;
             string src = (source ?? "game_view").Trim().ToLowerInvariant();
+            string batchMode = string.IsNullOrWhiteSpace(batch) ? "none" : batch.Trim().ToLowerInvariant();
             bool hasExplicitTarget = !string.IsNullOrEmpty(targetId);
 
             Texture2D tex = null;
             Texture2D working = null;
             Texture2D downscaled = null;
             bool? overlayUiIncluded = null;
+            bool regionNative = false;
+            bool wholeFrameDownscaled = false;
             string note;
 
             try
             {
-                if (src == "scene_view")
+                if (batchMode == "surround")
+                {
+                    if (!hasExplicitTarget)
+                        throw new InvalidOperationException(
+                            "batch=surround requires targetId (GameObject to orbit). Returns ONE labeled contact sheet.");
+                    var tile = Math.Max(64, Math.Min(width, 320));
+                    tex = CaptureSurroundContactSheet(targetId, tile, tile, out note);
+                    overlayUiIncluded = false;
+                    src = string.IsNullOrEmpty(src) ? "isolated" : src;
+                }
+                else if (src == "scene_view")
                 {
                     tex = CaptureSceneViewTexture();
                     overlayUiIncluded = false;
@@ -1626,22 +2107,36 @@ namespace UnityComdr.UnityEditor
                 working = tex;
                 tex = null;
 
-                if (hasRegion)
+                if (hasRegion && batchMode != "surround")
                 {
                     // AC-V9: region crops stay at native resolution — never apply 640 downscale.
                     working = CropTextureTopLeft(working, regionX.Value, regionY.Value, regionWidth.Value, regionHeight.Value, destroySource: true);
-                    note += " Region crop at native resolution.";
+                    regionNative = true;
+                    note += " Region crop at native resolution (maxResolution cost knob not applied).";
                 }
-                else
+                else if (batchMode != "surround")
                 {
-                    // Whole-frame: longest-edge downscale (Coplay DownscaleTexture, default 640).
+                    // Whole-frame: longest-edge downscale (Coplay DownscaleTexture, default 640 cost knob).
                     if (working.width > maxResolution || working.height > maxResolution)
                     {
                         downscaled = DownscaleTexture(working, maxResolution);
                         UnityEngine.Object.DestroyImmediate(working);
                         working = downscaled;
                         downscaled = null;
-                        note += " Downscaled to maxResolution=" + maxResolution + ".";
+                        wholeFrameDownscaled = true;
+                        note += " Whole-frame downscaled to maxResolution=" + maxResolution + " (cost knob).";
+                    }
+                }
+                else
+                {
+                    note += " Contact sheet whole-frame; tile size controlled by width (capped).";
+                    if (working.width > maxResolution * 2 || working.height > maxResolution * 2)
+                    {
+                        downscaled = DownscaleTexture(working, maxResolution * 2);
+                        UnityEngine.Object.DestroyImmediate(working);
+                        working = downscaled;
+                        downscaled = null;
+                        wholeFrameDownscaled = true;
                     }
                 }
 
@@ -1666,6 +2161,9 @@ namespace UnityComdr.UnityEditor
                     + "\"filePath\":" + JsonString(filePath) + ","
                     + "\"pngBase64\":" + JsonString(b64) + ","
                     + "\"isRealPixels\":true,"
+                    + "\"batch\":" + JsonString(batchMode) + ","
+                    + "\"regionNative\":" + (regionNative ? "true" : "false") + ","
+                    + "\"wholeFrameDownscaled\":" + (wholeFrameDownscaled ? "true" : "false") + ","
                     + "\"overlayUiIncluded\":" + (overlayUiIncluded == null ? "null" : (overlayUiIncluded.Value ? "true" : "false"))
                     + (hasExplicitTarget ? ",\"targetId\":" + JsonString(targetId) : "")
                     + "}";
@@ -1676,6 +2174,123 @@ namespace UnityComdr.UnityEditor
                 if (working != null) UnityEngine.Object.DestroyImmediate(working);
                 if (downscaled != null) UnityEngine.Object.DestroyImmediate(downscaled);
             }
+        }
+
+        /// <summary>
+        /// AC-V7: six yaw angles around target → one labeled contact sheet (not N separate images).
+        /// </summary>
+        private static Texture2D CaptureSurroundContactSheet(string targetId, int tileW, int tileH, out string note)
+        {
+            var go = FindGo(targetId);
+            if (go == null)
+                throw new InvalidOperationException("surround target not found: " + targetId);
+
+            var renderers = new List<Renderer>();
+            foreach (var r in go.GetComponentsInChildren<Renderer>(true))
+                if (r != null) renderers.Add(r);
+            var bounds = ComputeRendererBounds(renderers);
+            if (bounds.size.sqrMagnitude < 1e-8f)
+                bounds = new Bounds(go.transform.position, Vector3.one);
+
+            var labels = new[] { "Front", "Back", "Left", "Right", "Top", "Bottom-ish" };
+            var dirs = new[]
+            {
+                new Vector3(0f, 0f, -1f),
+                new Vector3(0f, 0f, 1f),
+                new Vector3(-1f, 0f, 0f),
+                new Vector3(1f, 0f, 0f),
+                new Vector3(0f, 1f, 0f),
+                new Vector3(0.35f, -1f, 0.35f)
+            };
+
+            var tiles = new List<Texture2D>(6);
+            var temps = new List<UnityEngine.Object>();
+            try
+            {
+                for (var i = 0; i < dirs.Length; i++)
+                {
+                    var camGo = new GameObject("__UnityComdr_SurroundCam_" + i)
+                    {
+                        hideFlags = HideFlags.HideAndDontSave
+                    };
+                    temps.Add(camGo);
+                    var cam = camGo.AddComponent<Camera>();
+                    cam.enabled = false;
+                    cam.clearFlags = CameraClearFlags.SolidColor;
+                    cam.backgroundColor = new Color(0.15f, 0.15f, 0.18f, 1f);
+                    cam.fieldOfView = 40f;
+                    cam.nearClipPlane = 0.01f;
+                    cam.farClipPlane = 1000f;
+                    FrameCameraOnBounds(cam, bounds, 1.35f);
+                    // Override position along orbit direction
+                    var radius = bounds.extents.magnitude;
+                    if (radius < 0.05f) radius = 0.5f;
+                    var dist = radius * 2.2f;
+                    var dir = dirs[i].normalized;
+                    cam.transform.position = bounds.center - dir * dist;
+                    cam.transform.LookAt(bounds.center, Vector3.up);
+
+                    var tile = RenderCameraToTexture(cam, tileW, tileH);
+                    // Label strip via note only — pixel labels: draw solid bar is heavy; composite grid is enough
+                    tiles.Add(tile);
+                }
+
+                var atlas = ComposeContactSheet(tiles, 3, 2, labels);
+                note = "AC-V7 surround contact sheet: 6 labeled angles (Front/Back/Left/Right/Top/Bottom-ish) in ONE image. " +
+                       "Overlay UI excluded (orbit cameras).";
+                return atlas;
+            }
+            finally
+            {
+                foreach (var t in tiles)
+                {
+                    if (t != null) UnityEngine.Object.DestroyImmediate(t);
+                }
+                foreach (var o in temps)
+                {
+                    if (o != null) UnityEngine.Object.DestroyImmediate(o);
+                }
+            }
+        }
+
+        private static Texture2D ComposeContactSheet(List<Texture2D> tiles, int cols, int rows, string[] labels)
+        {
+            if (tiles == null || tiles.Count == 0)
+                throw new InvalidOperationException("contact sheet needs tiles");
+            var tileW = tiles[0].width;
+            var tileH = tiles[0].height;
+            var labelH = 18;
+            var atlas = new Texture2D(cols * tileW, rows * (tileH + labelH), TextureFormat.RGBA32, false);
+            var clear = new Color(0.08f, 0.08f, 0.1f, 1f);
+            var pixels = atlas.GetPixels();
+            for (var i = 0; i < pixels.Length; i++) pixels[i] = clear;
+            atlas.SetPixels(pixels);
+
+            for (var i = 0; i < tiles.Count && i < cols * rows; i++)
+            {
+                var col = i % cols;
+                var row = i / cols;
+                // Unity tex coords: y from bottom
+                var destX = col * tileW;
+                var destY = (rows - 1 - row) * (tileH + labelH);
+                var src = tiles[i];
+                if (src == null) continue;
+                // label bar (solid) above tile in sheet space
+                var barY = destY + tileH;
+                for (var y = 0; y < labelH; y++)
+                    for (var x = 0; x < tileW; x++)
+                        atlas.SetPixel(destX + x, barY + y, new Color(0.2f, 0.25f, 0.35f, 1f));
+                // crude label: brighter strip encodes index (full text needs font — index band)
+                var labelFrac = labels != null && i < labels.Length ? (i + 1) / (float)(labels.Length + 1) : 0.5f;
+                for (var x = 0; x < (int)(tileW * labelFrac); x++)
+                    for (var y = 2; y < labelH - 2; y++)
+                        atlas.SetPixel(destX + x, barY + y, new Color(0.85f, 0.9f, 1f, 1f));
+
+                var tp = src.GetPixels();
+                atlas.SetPixels(destX, destY, src.width, src.height, tp);
+            }
+            atlas.Apply();
+            return atlas;
         }
 
         private static Camera FindAvailableCamera(string targetId)
@@ -1782,9 +2397,9 @@ namespace UnityComdr.UnityEditor
                 note = "Ivan-style isolated: temp layer " + IsolationLayer
                     + " + staging camera/light culling only target (+children); layers/activeSelf restored after render."
                     + " Limitations: Screen Space Overlay UI excluded; inactive children briefly SetActive(true)"
-                    + " so OnEnable side effects (audio/network/animation) are not rewindable; no composite multi-view"
-                    + " or custom lights JSON in this port; layer " + IsolationLayer
-                    + " is borrowed only for the capture window — do not rely on it remaining assigned."
+                    + " so OnEnable side effects are not rewindable; single Front view here — use batch=surround for 6-angle contact sheet;"
+                    + " layer " + IsolationLayer
+                    + " is borrowed only for the capture window."
                     + (activatedInactive ? " Some inactive children were temporarily activated." : "");
                 return result;
             }

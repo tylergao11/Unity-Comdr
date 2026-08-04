@@ -21,7 +21,7 @@ Unity-Comdr is implemented primarily as **original C# code**. It does **not** cu
 
 | Upstream source | Our file | Copy method |
 |-----------------|----------|-------------|
-| Coplay `MCPForUnity/Editor/Tools/RunTests.cs` + `GetTestJob.cs` — start returns `{job_id, status}`; poll by job id | `src/UnityComdr.Core/Skills/SampleSkills.cs` (`tests_run` / `tests_status`) | Pattern port (mode-only start; InMemory completes immediately) |
+| Coplay `MCPForUnity/Editor/Tools/RunTests.cs` + `GetTestJob.cs` — start returns `{job_id, status}`; poll by job id | `SampleSkills` + `LiveUnityBridgeServer` `tests.*` via `TestRunnerApi` | Pattern + live API (headless isError; no fake console/script tests) |
 
 ## Borrowed algorithms / patterns (Phase I install)
 

@@ -19,6 +19,9 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
     private int _sessionGeneration;
     private bool _hasSessionGeneration;
 
+    /// <inheritdoc />
+    public string HostMode => "live";
+
     public BridgeClientEditorHost(int port = EditorHostFactory.DefaultLiveBridgePort)
     {
         _port = port;
@@ -212,6 +215,7 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
             // Lifecycle probe may adopt a new sessionGeneration after domain reload.
             var state = Result<EditorState>(
                 Call(BridgeProtocol.Methods.GetState, null, trackGeneration: true, allowGenerationChange: true)) ?? new();
+            state.HostMode = HostMode;
             if (string.IsNullOrWhiteSpace(state.Phase))
             {
                 state.Phase = state.IsCompiling
@@ -434,18 +438,125 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
     public IReadOnlyList<string> ListShaders() =>
         Result<List<string>>(Call(BridgeProtocol.Methods.ShaderList, null)) ?? new();
 
-    // --- Packages / menu / screenshot / profiler ---
-    public IReadOnlyList<PackageInfo> ListPackages() =>
-        Result<List<PackageInfo>>(Call(BridgeProtocol.Methods.PackageList, null)) ?? new();
+    // --- Packages (async job on Unity main; poll here on host process — never block Editor) ---
+    public IReadOnlyList<PackageInfo> ListPackages()
+    {
+        var jobId = StartPackageJob(BridgeProtocol.Methods.PackageList, null);
+        var snap = PollPackageJob(jobId);
+        return snap.Packages ?? new List<PackageInfo>();
+    }
 
-    public PackageInfo AddPackage(string packageIdOrUrl) =>
-        Result<PackageInfo>(Call(BridgeProtocol.Methods.PackageAdd, A(("package", packageIdOrUrl)))) ?? new();
+    public PackageInfo AddPackage(string packageIdOrUrl)
+    {
+        var jobId = StartPackageJob(BridgeProtocol.Methods.PackageAdd, A(("package", packageIdOrUrl)));
+        var snap = PollPackageJob(jobId);
+        return snap.Package ?? throw new InvalidOperationException(snap.Error ?? "package add returned empty");
+    }
 
-    public bool RemovePackage(string packageName) =>
-        Result<bool>(Call(BridgeProtocol.Methods.PackageRemove, A(("package", packageName))));
+    public bool RemovePackage(string packageName)
+    {
+        var jobId = StartPackageJob(BridgeProtocol.Methods.PackageRemove, A(("package", packageName)));
+        var snap = PollPackageJob(jobId);
+        return snap.Removed == true;
+    }
 
-    public IReadOnlyList<PackageInfo> SearchPackages(string query) =>
-        Result<List<PackageInfo>>(Call(BridgeProtocol.Methods.PackageSearch, A(("query", query)))) ?? new();
+    public IReadOnlyList<PackageInfo> SearchPackages(string query)
+    {
+        var jobId = StartPackageJob(BridgeProtocol.Methods.PackageSearch, A(("query", query)));
+        var snap = PollPackageJob(jobId);
+        return snap.Packages ?? new List<PackageInfo>();
+    }
+
+    private string StartPackageJob(string method, Dictionary<string, object?>? args)
+    {
+        var start = Result<PackageJobWire>(Call(method, args))
+                    ?? throw new InvalidOperationException("package job start returned empty");
+        if (string.IsNullOrEmpty(start.JobId))
+            throw new InvalidOperationException("package job missing jobId");
+        // May already be completed if UPM finished before first status poll.
+        if (string.Equals(start.Status, "failed", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(start.Error ?? "package job failed at start");
+        return start.JobId;
+    }
+
+    private PackageJobWire PollPackageJob(string jobId, int timeoutMs = 120_000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            var snap = Result<PackageJobWire>(Call(BridgeProtocol.Methods.PackageStatus, A(("jobId", jobId))))
+                       ?? throw new InvalidOperationException("package.status empty");
+            if (string.Equals(snap.Status, "failed", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(snap.Error ?? $"package job {jobId} failed");
+            if (string.Equals(snap.Status, "completed", StringComparison.OrdinalIgnoreCase))
+                return snap;
+            Thread.Sleep(80); // host-side wait only — Unity main thread stays free via update pump
+        }
+        throw new TimeoutException($"package job {jobId} timed out after {timeoutMs}ms");
+    }
+
+    private sealed class PackageJobWire
+    {
+        public string? JobId { get; set; }
+        public string? Status { get; set; }
+        public string? Op { get; set; }
+        public string? Error { get; set; }
+        public List<PackageInfo>? Packages { get; set; }
+        public PackageInfo? Package { get; set; }
+        public bool? Removed { get; set; }
+    }
+
+    public TestJobSnapshot StartTests(string mode, string? filter = null) =>
+        Result<TestJobSnapshot>(Call(BridgeProtocol.Methods.TestsRun, A(("mode", mode), ("filter", filter))))
+        ?? new TestJobSnapshot { Status = "failed", Mode = mode ?? "EditMode", Note = "empty bridge result" };
+
+    public TestJobSnapshot GetTestJob(string jobId) =>
+        Result<TestJobSnapshot>(Call(BridgeProtocol.Methods.TestsStatus, A(("jobId", jobId))))
+        ?? new TestJobSnapshot { JobId = jobId, Status = "failed", Note = "empty bridge result" };
+
+    /// <summary>
+    /// Starts non-blocking RetrieveTestList job then polls tests.status on the host process.
+    /// </summary>
+    public IReadOnlyList<TestCatalogEntry> ListTests(string? mode = null)
+    {
+        var start = Result<TestJobSnapshot>(Call(BridgeProtocol.Methods.TestsList, A(("mode", mode))))
+                    ?? throw new InvalidOperationException("tests.list start empty");
+        if (string.Equals(start.Status, "failed", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(start.Note ?? "tests.list failed");
+        if (string.Equals(start.Status, "completed", StringComparison.OrdinalIgnoreCase))
+            return MapCatalog(start);
+
+        var jobId = start.JobId;
+        if (string.IsNullOrEmpty(jobId))
+            throw new InvalidOperationException("tests.list missing jobId");
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 60_000)
+        {
+            var snap = GetTestJob(jobId);
+            if (string.Equals(snap.Status, "failed", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(snap.Note ?? "tests.list job failed");
+            if (string.Equals(snap.Status, "completed", StringComparison.OrdinalIgnoreCase))
+                return MapCatalog(snap);
+            Thread.Sleep(80);
+        }
+        throw new TimeoutException($"tests.list job {jobId} timed out");
+    }
+
+    private static List<TestCatalogEntry> MapCatalog(TestJobSnapshot snap)
+    {
+        var list = new List<TestCatalogEntry>();
+        if (snap.Results == null) return list;
+        foreach (var r in snap.Results)
+        {
+            list.Add(new TestCatalogEntry
+            {
+                Name = r.Name,
+                Mode = string.IsNullOrEmpty(snap.Mode) ? "EditMode" : snap.Mode
+            });
+        }
+        return list;
+    }
 
     public IReadOnlyList<MenuItemInfo> ListMenuItems(string? filter = null) =>
         Result<List<MenuItemInfo>>(Call(BridgeProtocol.Methods.MenuList, A(("filter", filter)))) ?? new();
@@ -462,7 +573,8 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
         int? regionX = null,
         int? regionY = null,
         int? regionWidth = null,
-        int? regionHeight = null) =>
+        int? regionHeight = null,
+        string? batch = null) =>
         Result<ScreenshotResult>(Call(BridgeProtocol.Methods.Screenshot, A(
             ("source", source),
             ("targetId", targetId),
@@ -472,7 +584,8 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
             ("regionX", regionX),
             ("regionY", regionY),
             ("regionWidth", regionWidth),
-            ("regionHeight", regionHeight))))
+            ("regionHeight", regionHeight),
+            ("batch", batch))))
         ?? new ScreenshotResult
         {
             Source = source,
@@ -481,7 +594,8 @@ public sealed class BridgeClientEditorHost : IEditorHost, IDisposable
             Height = height,
             IsRealPixels = false,
             Format = "none",
-            Note = "Live bridge returned an empty screenshot result."
+            Batch = batch,
+            Note = "Live bridge returned an empty screenshot result — no real pixels."
         };
 
     public ProfilerSnapshot GetProfilerSnapshot() =>

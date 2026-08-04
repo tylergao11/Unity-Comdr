@@ -88,6 +88,11 @@ public static class BridgeProtocol
         public const string PackageAdd = "package.add";
         public const string PackageRemove = "package.remove";
         public const string PackageSearch = "package.search";
+        /// <summary>Poll async UPM job started by package.list/add/remove/search.</summary>
+        public const string PackageStatus = "package.status";
+        public const string TestsRun = "tests.run";
+        public const string TestsStatus = "tests.status";
+        public const string TestsList = "tests.list";
         public const string MenuList = "menu.list";
         public const string MenuExecute = "menu.execute";
         public const string Screenshot = "screenshot.capture";

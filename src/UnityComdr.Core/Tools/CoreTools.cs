@@ -130,6 +130,8 @@ public static class CoreTools
             async (_, _) =>
             {
                 var s = editor.GetState();
+                if (string.IsNullOrWhiteSpace(s.HostMode))
+                    s.HostMode = editor.HostMode;
                 return await Task.FromResult(ToolResult.OkJson(new
                 {
                     hostMode = s.HostMode,
@@ -147,7 +149,7 @@ public static class CoreTools
 
         registry.RegisterCore(Make(
             "editor_compile",
-            "Request script recompile; returns incremented compileEpoch. Console entries from older epochs are marked stale:true on console_read.",
+            "Request script recompile via Editor compilation pipeline when live (CompilationPipeline.RequestScriptCompilation); returns compileEpoch. Console entries from older epochs are marked stale:true on console_read.",
             JsonSchemaHelper.Object(),
             async (_, _) =>
             {
@@ -156,9 +158,12 @@ public static class CoreTools
                 return await Task.FromResult(ToolResult.OkJson(new
                 {
                     ok = true,
+                    hostMode = editor.HostMode,
                     compileEpoch = s.CompileEpoch,
                     isCompiling = s.IsCompiling,
-                    message = "Compile requested."
+                    message = string.Equals(editor.HostMode, "live", StringComparison.OrdinalIgnoreCase)
+                        ? "Compile requested (CompilationPipeline)."
+                        : "Headless compile epoch bumped (synthetic)."
                 }));
             }));
 
@@ -379,11 +384,11 @@ public static class CoreTools
 
         registry.RegisterCore(Make(
             "component_manage",
-            "Component ops: add|get|modify|remove|list_types.",
+            "Component ops: add|get|modify|remove|list_types. Live get exports SerializedObject properties (bounded); list_types scans loaded Component types. modify supports scalar + Vector2/3/Color/Enum. UI/RectTransform mutations return layout summary + vision nextStep for region crop re-check (AC-V10).",
             JsonSchemaHelper.Object(
                 ("action", JsonSchemaHelper.String(null, new[] { "add", "get", "modify", "remove", "list_types" }), true),
                 ("target", JsonSchemaHelper.String("GameObject id or path"), false),
-                ("type", JsonSchemaHelper.String("Component type name e.g. Rigidbody"), false),
+                ("type", JsonSchemaHelper.String("Component type name e.g. Rigidbody or RectTransform"), false),
                 ("filter", JsonSchemaHelper.String("Filter for list_types"), false),
                 ("properties", JsonSchemaHelper.ObjectOpen("Key/value property bag"), false)
             ),
@@ -408,14 +413,14 @@ public static class CoreTools
                         object snapshot = added == null
                             ? new { typeName = type, properties = props ?? new Dictionary<string, object?>() }
                             : ComponentSnapshot(added);
-                        return ToolResult.OkJson(new { target, component = snapshot });
+                        return ToolResult.OkJson(MutationComponentResult(target, type, snapshot, added));
                     }
                     case "get":
                     {
                         var c = editor.GetComponent(target, type);
                         return c == null
                             ? ToolResult.Error($"Component {type} not found on {target}")
-                            : ToolResult.OkJson(ComponentSnapshot(c));
+                            : ToolResult.OkJson(MutationComponentResult(target, type, ComponentSnapshot(c), c));
                     }
                     case "modify":
                     {
@@ -427,7 +432,7 @@ public static class CoreTools
                         object snapshot = modified == null
                             ? new { typeName = type, properties = props }
                             : ComponentSnapshot(modified);
-                        return ToolResult.OkJson(new { target, component = snapshot });
+                        return ToolResult.OkJson(MutationComponentResult(target, type, snapshot, modified));
                     }
                     case "remove":
                     {
@@ -612,7 +617,7 @@ public static class CoreTools
     {
         registry.RegisterEscapeHatch(Make(
             "reflect_call",
-            "ESCAPE HATCH (off by default): describe a reflective call. Headless returns a dry-run plan.",
+            "ESCAPE HATCH (off by default): PLAN-ONLY. Returns a dry-run plan; does NOT invoke methods. Not live reflection.",
             JsonSchemaHelper.Object(
                 ("typeName", JsonSchemaHelper.String("CLR type name"), true),
                 ("methodName", JsonSchemaHelper.String("Method name"), true),
@@ -624,16 +629,19 @@ public static class CoreTools
                 var method = RequireString(args, "methodName");
                 return await Task.FromResult(ToolResult.OkJson(new
                 {
+                    planOnly = true,
+                    executed = false,
                     dryRun = true,
                     typeName,
                     method,
-                    note = "Live reflection executes only under UnityEditorHost with escape hatches enabled."
+                    hostMode = editor.HostMode,
+                    note = "plan-only: no reflection is executed in any hostMode. Claim NO for live execute."
                 }));
             }));
 
         registry.RegisterEscapeHatch(Make(
             "execute_code",
-            "ESCAPE HATCH (off by default): execute a short C# snippet (sandboxed/denied in headless).",
+            "ESCAPE HATCH (off by default): PLAN-ONLY. Does NOT run C#; returns rejected plan. No Roslyn sandbox.",
             JsonSchemaHelper.Object(
                 ("code", JsonSchemaHelper.String("C# snippet"), true)
             ),
@@ -642,10 +650,13 @@ public static class CoreTools
                 var code = RequireString(args, "code");
                 return await Task.FromResult(ToolResult.OkJson(new
                 {
+                    planOnly = true,
+                    executed = false,
                     accepted = false,
                     dryRun = true,
                     codeLength = code.Length,
-                    note = "Dynamic execute is gated; enable escape hatches and use Unity Editor host for real runs."
+                    hostMode = editor.HostMode,
+                    note = "plan-only: code is never executed. Claim NO for execute_code."
                 }));
             }));
 
@@ -711,6 +722,80 @@ public static class CoreTools
         typeName = c.TypeName,
         properties = c.Properties
     };
+
+    /// <summary>AC-V10: layout post-state + path to native region crop re-check after UI mutations.</summary>
+    private static object MutationComponentResult(string target, string type, object snapshot, ComponentData? data)
+    {
+        var layout = TryLayoutSummary(type, data);
+        if (layout == null)
+            return new { target, component = snapshot };
+
+        return new
+        {
+            target,
+            component = snapshot,
+            layout,
+            vision = new
+            {
+                nextStep =
+                    "Re-check pixels: skill_manage action=load id=screenshots; " +
+                    "screenshot_capture source=game_view with regionX/regionY/regionWidth/regionHeight from layout " +
+                    "(native resolution crop — maxResolution cost knob does NOT apply to regions).",
+                regionNative = true
+            }
+        };
+    }
+
+    private static object? TryLayoutSummary(string type, ComponentData? data)
+    {
+        if (data?.Properties == null || data.Properties.Count == 0)
+        {
+            if (type.Contains("RectTransform", StringComparison.OrdinalIgnoreCase) ||
+                type.Contains("Layout", StringComparison.OrdinalIgnoreCase))
+                return new { typeName = type, note = "layout type; properties empty — call get after live modify" };
+            return null;
+        }
+
+        var layoutKeys = new[]
+        {
+            "anchorMin", "anchorMax", "anchoredPosition", "sizeDelta", "pivot",
+            "offsetMin", "offsetMax", "anchorPos", "rect", "localPosition", "localScale"
+        };
+        var bag = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in data.Properties)
+        {
+            if (layoutKeys.Any(k => kv.Key.Contains(k, StringComparison.OrdinalIgnoreCase)) ||
+                kv.Key.Contains("anchor", StringComparison.OrdinalIgnoreCase) ||
+                kv.Key.Contains("offset", StringComparison.OrdinalIgnoreCase) ||
+                kv.Key.Contains("size", StringComparison.OrdinalIgnoreCase) ||
+                kv.Key.Contains("pivot", StringComparison.OrdinalIgnoreCase) ||
+                kv.Key.Contains("rect", StringComparison.OrdinalIgnoreCase))
+            {
+                bag[kv.Key] = kv.Value;
+            }
+        }
+
+        var isUiType = type.Contains("RectTransform", StringComparison.OrdinalIgnoreCase) ||
+                       type.Contains("Layout", StringComparison.OrdinalIgnoreCase) ||
+                       type.Contains("Canvas", StringComparison.OrdinalIgnoreCase);
+        if (bag.Count == 0 && !isUiType)
+            return null;
+
+        return new
+        {
+            typeName = type,
+            rect = bag.TryGetValue("rect", out var r) ? r : null,
+            anchorMin = FindProp(bag, "anchorMin"),
+            anchorMax = FindProp(bag, "anchorMax"),
+            anchoredPosition = FindProp(bag, "anchoredPosition") ?? FindProp(bag, "anchorPos"),
+            sizeDelta = FindProp(bag, "sizeDelta"),
+            pivot = FindProp(bag, "pivot"),
+            properties = bag.Count > 0 ? bag : data.Properties
+        };
+    }
+
+    private static object? FindProp(Dictionary<string, object?> bag, string key) =>
+        bag.TryGetValue(key, out var v) ? v : bag.FirstOrDefault(kv => kv.Key.Contains(key, StringComparison.OrdinalIgnoreCase)).Value;
 
     private static object DetailGo(GameObjectData go) => new
     {

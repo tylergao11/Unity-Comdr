@@ -9,6 +9,9 @@ namespace UnityComdr.Editor;
 /// </summary>
 public sealed class InMemoryEditorHost : IEditorHost
 {
+    /// <inheritdoc />
+    public string HostMode => "headless";
+
     private readonly List<ConsoleLogEntry> _logs = new();
     private readonly Dictionary<string, Dictionary<string, GameObjectData>> _objectsByScene =
         new(StringComparer.OrdinalIgnoreCase);
@@ -800,59 +803,45 @@ public sealed class InMemoryEditorHost : IEditorHost
 
     public IReadOnlyList<string> ListShaders() => BuiltinShaders.ToList();
 
-    // --- Packages ---
+    // --- Packages (headless: not UPM — throw so callers cannot fake success) ---
 
     public IReadOnlyList<PackageInfo> ListPackages() =>
-        _packages.Select(p => new PackageInfo { Name = p.Name, Version = p.Version, Source = p.Source, DisplayName = p.DisplayName }).ToList();
+        throw new InvalidOperationException(
+            "package_manage requires hostMode=live (UnityEditor.PackageManager.Client). Headless InMemory has no UPM.");
 
-    public PackageInfo AddPackage(string packageIdOrUrl)
-    {
-        var name = packageIdOrUrl.Contains("://") || packageIdOrUrl.Contains("git")
-            ? packageIdOrUrl.Split('/').Last().Replace(".git", "")
-            : packageIdOrUrl.Split('@')[0];
-        var version = packageIdOrUrl.Contains('@') ? packageIdOrUrl.Split('@')[1] : "1.0.0";
-        var source = packageIdOrUrl.Contains("git") || packageIdOrUrl.Contains("://") ? "git" : "registry";
-        var existing = _packages.FirstOrDefault(p => p.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-        if (existing != null)
+    public PackageInfo AddPackage(string packageIdOrUrl) =>
+        throw new InvalidOperationException(
+            "package add requires hostMode=live PackageManager.Client. Headless cannot mutate a real project.");
+
+    public bool RemovePackage(string packageName) =>
+        throw new InvalidOperationException(
+            "package remove requires hostMode=live PackageManager.Client.");
+
+    public IReadOnlyList<PackageInfo> SearchPackages(string query) =>
+        throw new InvalidOperationException(
+            "package search requires hostMode=live PackageManager.Client (not a hardcoded catalog).");
+
+    public TestJobSnapshot StartTests(string mode, string? filter = null) =>
+        new()
         {
-            existing.Version = version;
-            return new PackageInfo { Name = existing.Name, Version = existing.Version, Source = existing.Source, DisplayName = existing.DisplayName };
-        }
-        var pkg = new PackageInfo { Name = name, Version = version, Source = source, DisplayName = name };
-        _packages.Add(pkg);
-        AddConsoleLog(new ConsoleLogEntry(LogType.Log, $"Package added: {name}@{version}"));
-        return pkg;
-    }
+            JobId = "",
+            Status = "unsupported",
+            Mode = mode ?? "EditMode",
+            Filter = filter,
+            Passed = null,
+            Note = "TestRunnerApi requires hostMode=live. Headless does not fake test results."
+        };
 
-    public bool RemovePackage(string packageName)
-    {
-        var n = _packages.RemoveAll(p => p.Name.Equals(packageName, StringComparison.OrdinalIgnoreCase));
-        return n > 0;
-    }
+    public TestJobSnapshot GetTestJob(string jobId) =>
+        new()
+        {
+            JobId = jobId ?? "",
+            Status = "unsupported",
+            Note = "TestRunnerApi requires hostMode=live."
+        };
 
-    private static readonly PackageInfo[] RegistryCatalog =
-    {
-        new() { Name = "com.unity.cinemachine", Version = "2.9.7", Source = "registry", DisplayName = "Cinemachine" },
-        new() { Name = "com.unity.addressables", Version = "1.21.0", Source = "registry", DisplayName = "Addressables" },
-        new() { Name = "com.unity.netcode.gameobjects", Version = "1.8.0", Source = "registry", DisplayName = "Netcode" },
-        new() { Name = "com.unity.timeline", Version = "1.7.0", Source = "registry", DisplayName = "Timeline" },
-        new() { Name = "com.unity.probuilder", Version = "5.2.0", Source = "registry", DisplayName = "ProBuilder" },
-    };
-
-    public IReadOnlyList<PackageInfo> SearchPackages(string query)
-    {
-        query ??= "";
-        bool Match(PackageInfo p) =>
-            p.Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-            (p.DisplayName?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false);
-
-        var installed = _packages.Where(Match);
-        var catalog = RegistryCatalog.Where(Match)
-            .Where(c => !_packages.Any(i => i.Name.Equals(c.Name, StringComparison.OrdinalIgnoreCase)));
-        return installed.Concat(catalog)
-            .Select(p => new PackageInfo { Name = p.Name, Version = p.Version, Source = p.Source, DisplayName = p.DisplayName })
-            .ToList();
-    }
+    public IReadOnlyList<TestCatalogEntry> ListTests(string? mode = null) =>
+        Array.Empty<TestCatalogEntry>();
 
     // --- Menu ---
 
@@ -869,9 +858,8 @@ public sealed class InMemoryEditorHost : IEditorHost
         var item = _menuItems.FirstOrDefault(m => m.Path.Equals(menuPath, StringComparison.OrdinalIgnoreCase));
         if (item == null)
         {
-            // Allow unknown menu paths for extensibility; log only
-            AddConsoleLog(new ConsoleLogEntry(LogType.Warning, $"Menu item not in catalog (executed anyway): {menuPath}"));
-            return true;
+            AddConsoleLog(new ConsoleLogEntry(LogType.Warning, $"Menu item not in headless catalog: {menuPath}"));
+            return false;
         }
 
         // Simulate common menu side-effects
@@ -906,7 +894,7 @@ public sealed class InMemoryEditorHost : IEditorHost
     /// Test hook to inject a real PNG fixture for MCP image-protocol coverage.
     /// Production/headless path leaves this null (honest blindness).
     /// </summary>
-    public Func<string, string?, int, int, int, int?, int?, int?, int?, ScreenshotResult>? ScreenshotOverride { get; set; }
+    public Func<string, string?, int, int, int, int?, int?, int?, int?, string?, ScreenshotResult>? ScreenshotOverride { get; set; }
 
     /// <summary>
     /// Headless cannot see. Returns explicit blindness (<see cref="ScreenshotResult.IsRealPixels"/> = false)
@@ -921,10 +909,11 @@ public sealed class InMemoryEditorHost : IEditorHost
         int? regionX = null,
         int? regionY = null,
         int? regionWidth = null,
-        int? regionHeight = null)
+        int? regionHeight = null,
+        string? batch = null)
     {
         if (ScreenshotOverride != null)
-            return ScreenshotOverride(source, targetId, width, height, maxResolution, regionX, regionY, regionWidth, regionHeight);
+            return ScreenshotOverride(source, targetId, width, height, maxResolution, regionX, regionY, regionWidth, regionHeight, batch);
 
         return new ScreenshotResult
         {
@@ -937,10 +926,11 @@ public sealed class InMemoryEditorHost : IEditorHost
             FilePath = null,
             OverlayUiIncluded = null,
             Format = "none",
+            Batch = string.IsNullOrWhiteSpace(batch) ? "none" : batch,
+            RegionNative = regionX.HasValue && regionY.HasValue && regionWidth is > 0 && regionHeight is > 0,
             Note =
-                "Headless InMemoryEditorHost cannot capture real pixels. " +
-                "Open a live Unity Editor with the Unity-Comdr bridge (UNITYCOMDR_LIVE=1) " +
-                "and retry screenshot_capture with a camera or Scene View available."
+                "no live Editor — cannot capture real pixels (hostMode=headless). " +
+                "Open Unity with Unity-Comdr bridge (editor_state.hostMode=live) and retry screenshot_capture."
         };
     }
 
@@ -948,6 +938,7 @@ public sealed class InMemoryEditorHost : IEditorHost
 
     public IReadOnlyList<UiControlInfo> QueryUi(string? filter = null)
     {
+        // Headless seed UI is synthetic — return filtered seed but callers must check HostMode.
         IEnumerable<UiControlInfo> q = _uiControls.Values;
         if (!string.IsNullOrWhiteSpace(filter))
         {
@@ -970,27 +961,12 @@ public sealed class InMemoryEditorHost : IEditorHost
         float? deltaY = null,
         string? key = null)
     {
-        var note = $"simulated {action}" +
-                   (target != null ? $" target={target}" : "") +
-                   (key != null ? $" key={key}" : "");
-        _inputLog.Add(note);
-        AddConsoleLog(new ConsoleLogEntry(LogType.Log, note));
         return new InputSimulateResult
         {
-            Ok = true,
-            Action = action,
+            Ok = false,
+            Action = action ?? "",
             Target = target,
-            Note = note,
-            Effects =
-            {
-                ["x"] = x,
-                ["y"] = y,
-                ["toX"] = toX,
-                ["toY"] = toY,
-                ["deltaX"] = deltaX,
-                ["deltaY"] = deltaY,
-                ["key"] = key
-            }
+            Note = "input.simulate is not supported on headless; requires live Editor input injection (currently unsupported — use menu_manage / selection_manage)."
         };
     }
 
@@ -1055,9 +1031,10 @@ public sealed class InMemoryEditorHost : IEditorHost
 
     public void SaveProfilerData(string path)
     {
+        // Honest: in-memory metrics snapshot only (not Unity Profiler binary). Documented LIMITED.
         path = NormalizePath(path);
         _profilerSaves[path] = GetProfilerSnapshot();
-        AddConsoleLog(new ConsoleLogEntry(LogType.Log, $"Profiler snapshot saved: {path}"));
+        AddConsoleLog(new ConsoleLogEntry(LogType.Log, $"Profiler metrics snapshot (not .data binary) saved: {path}"));
     }
 
     public ProfilerSnapshot? LoadProfilerData(string path)

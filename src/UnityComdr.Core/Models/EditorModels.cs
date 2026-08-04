@@ -102,6 +102,31 @@ public sealed class EditorState
     public string? HostDetail { get; set; }
 }
 
+/// <summary>Async test job snapshot (TestRunnerApi on live; unsupported on headless).</summary>
+public sealed class TestJobSnapshot
+{
+    public string JobId { get; set; } = "";
+    public string Status { get; set; } = ""; // running | completed | failed | unsupported
+    public string Mode { get; set; } = "EditMode";
+    public string? Filter { get; set; }
+    public bool? Passed { get; set; }
+    public List<TestCaseResultRow> Results { get; set; } = new();
+    public string? Note { get; set; }
+}
+
+public sealed class TestCaseResultRow
+{
+    public string Name { get; set; } = "";
+    public string Status { get; set; } = "";
+    public string? Message { get; set; }
+}
+
+public sealed class TestCatalogEntry
+{
+    public string Name { get; set; } = "";
+    public string Mode { get; set; } = "EditMode";
+}
+
 public sealed class MaterialData
 {
     public string Path { get; set; } = "";

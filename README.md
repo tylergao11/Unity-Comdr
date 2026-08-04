@@ -20,10 +20,14 @@
 | High tool-count forks | Breadth checklist | Breadth via **skill catalog**, not 200 always-on tools |
 
 Full matrix: [`docs/competitive-audit-full.md`](docs/competitive-audit-full.md)  
-**Launch go/no-go:** [`docs/launch-readiness.md`](docs/launch-readiness.md)  
-**Production capability audit (all Editor skills/core):** [`docs/production-capability-audit.md`](docs/production-capability-audit.md)  
-**Borrow plan (file-level, AI-first pain points):** [`docs/borrow-plan.md`](docs/borrow-plan.md)  
+**Acceptance (useful = do it; no “later”):** [`docs/acceptance-criteria.md`](docs/acceptance-criteria.md)  
+**Fidelity standard (what “supported” means):** [`docs/fidelity-audit-standard.md`](docs/fidelity-audit-standard.md)  
+**Capability register (Impl × Claim):** [`docs/production-capability-audit.md`](docs/production-capability-audit.md)  
+**Launch (protocol vs fidelity):** [`docs/launch-readiness.md`](docs/launch-readiness.md)  
+**Borrow plan:** [`docs/borrow-plan.md`](docs/borrow-plan.md)  
 Security defaults: [`SECURITY.md`](SECURITY.md)
+
+> **Honesty:** several skill surfaces (tests, packages-as-UPM, escape execute, UI/input) are **Claim NO** or **LIMITED** under the fidelity standard — wiring exists; Editor semantics may be shallow or simulated. Do not treat “tool is listed” as upstream parity.
 
 ## Go-live (local open-source)
 
@@ -33,12 +37,11 @@ Complete operator path (no prior session needed):
 |------|--------|
 | 1 | Install UPM package from `packages/com.unitycomdr.mcp` (file: or git `?path=/packages/com.unitycomdr.mcp`) |
 | 2 | Build host: `dotnet build UnityComdr.sln -c Release` |
-| 3 | Gate: `dotnet test UnityComdr.sln -c Release` (must exit 0) |
-| 4 | In Unity **Window → Unity-Comdr MCP**: use **Open install deeplink** (Cursor / VS Code) or **Write project-local config** (relative host path into `.cursor/mcp.json` / `.vscode/mcp.json` / `.claude/mcp.json` / `.codex/config.toml`). Copy-JSON remains as fallback. |
-| 5 | Or manually point the client at `src/UnityComdr.McpHost/bin/Release/net8.0/UnityComdr.McpHost.dll` via `dotnet exec` |
-| 6 | Optional live Editor: open Unity with package → bridge auto-starts on `127.0.0.1:17890` — use the Doctor foldout to confirm listening / last client call / host DLL |
-| 7 | Optional CI headless: set `UNITY_COMDR_FORCE_HEADLESS=1` (or leave unset; host falls back if bridge down) |
-| 8 | Override bridge port: `UNITY_COMDR_BRIDGE_PORT=17890` |
+| 3 | In Unity **Window → Unity-Comdr MCP**: use **Open install deeplink** (Cursor / VS Code) or **Write project-local config** (relative host path into `.cursor/mcp.json` / `.vscode/mcp.json` / `.claude/mcp.json` / `.codex/config.toml`). Copy-JSON remains as fallback. |
+| 4 | Or manually point the client at `src/UnityComdr.McpHost/bin/Release/net8.0/UnityComdr.McpHost.dll` via `dotnet exec` |
+| 5 | **Live Editor required for real project control:** open Unity with package → bridge auto-starts on `127.0.0.1:17890` — Doctor foldout for listening / last client call / host DLL |
+| 6 | Optional headless process only: `UNITY_COMDR_FORCE_HEADLESS=1` (synthetic host — **not** fidelity; see fidelity standard) |
+| 7 | Override bridge port: `UNITY_COMDR_BRIDGE_PORT=17890` |
 
 **Requirements:** Unity 2021.3+ for live Editor path. **No Python, Node, or cloud login** for local control.
 
@@ -62,7 +65,6 @@ Open **Window → Unity-Comdr MCP** for bridge status, Cursor/VS Code deeplinks,
 
 ```bash
 dotnet build UnityComdr.sln -c Release
-dotnet test UnityComdr.sln -c Release
 ```
 
 Optional self-contained exe:
@@ -169,23 +171,22 @@ skill_manage action=unload id=playmode
 escape_hatches_set enabled=true
 ```
 
-- `reflect_call` — dry-run in headless; live reflection under Editor host (P1)
-- `execute_code` — dry-run in headless; Roslyn under Editor host (P1)
+- `reflect_call` / `execute_code` — **plan-only** (`planOnly=true`, never executes). Claim **NO** for real reflection/Roslyn (see fidelity register).
 
 ## Full agent loops
 
-| Loop | Tools path | Test |
-|------|------------|------|
-| **Code-fix** | `console_read` → `script_write` → `editor_compile` → `console_read` | `FullLoop_CodeFix_*` |
-| **Scene-build** | `scene_manage` → `gameobject_manage` → `component_manage` → `assets_manage` → `hierarchy_get` | `FullLoop_SceneBuild_*` |
-| **Playmode-verify** | `skill_manage load playmode` → `playmode_control` play/pause/stop/step → `screenshot_capture` | `FullLoop_PlaymodeVerify_*` |
+| Loop | Tools path | Notes |
+|------|------------|--------|
+| **Code-fix** | `console_read` → `script_write` → `editor_compile` → `console_read` | compile is Claim **LIMITED** (Refresh-oriented) |
+| **Scene-build** | `scene_manage` → `gameobject_manage` → `component_manage` → `assets_manage` → `hierarchy_get` | component **get** properties often empty |
+| **Playmode-verify** | `skill_manage load playmode` → `playmode_control` → `screenshot_capture` | screenshot needs **live** Editor; not headless |
 
 ## Live Unity bridge
 
-When the UPM package is loaded, **LiveUnityBridgeServer** listens on `127.0.0.1:17890`. The MCP host (`EditorHostFactory`) prefers **BridgeClientEditorHost** (same `IEditorHost` as headless). If the Editor is not running, it falls back to **InMemoryEditorHost** (CI-safe).
+When the UPM package is loaded, **LiveUnityBridgeServer** listens on `127.0.0.1:17890`. The MCP host (`EditorHostFactory`) prefers **BridgeClientEditorHost**. If the Editor is not running, it falls back to **InMemoryEditorHost** — a **synthetic** world for process bring-up, **not** fidelity proof. Prefer live Unity for real projects; see `hostMode` debt in [`docs/audit.md`](docs/audit.md).
 
 - Env: `UNITY_COMDR_FORCE_HEADLESS=1` · `UNITY_COMDR_BRIDGE_PORT=17890`
-- Status: [docs/full-flow-status.md](docs/full-flow-status.md)
+- Fidelity claims: [docs/production-capability-audit.md](docs/production-capability-audit.md)
 
 ## Architecture
 
@@ -205,18 +206,20 @@ MCP client  --stdio JSON-RPC-->  UnityComdr.McpHost
 
 Docs:
 
-- [Product & UX frontier (design probe, 2026-08-03)](docs/product-ux-frontier.md)
+- [Fidelity audit standard](docs/fidelity-audit-standard.md)
+- [Capability fidelity register](docs/production-capability-audit.md)
+- [Product & UX frontier](docs/product-ux-frontier.md)
 - [Competitive audit (full)](docs/competitive-audit-full.md)
 - [Architecture](docs/architecture.md)
-- [Transport spike](docs/spike-transport.md)
-- [Requirements](docs/brainstorms/2026-08-02-unity-comdr-mcp-requirements.md)
-- [Audit notes](docs/audit.md)
+- [Audit / debt ledger](docs/audit.md)
 
 ## Development
 
 ```bash
-dotnet test
+dotnet build UnityComdr.sln -c Release
 ```
+
+Fidelity is judged by **source review against the fidelity standard**, not by test suites.
 
 ```text
 packages/com.unitycomdr.mcp/   UPM

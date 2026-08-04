@@ -186,26 +186,16 @@ public class AgentUxEnvelopeTests
     }
 
     [Fact]
-    public async Task Tests_run_returns_job_and_tests_status_polls()
+    public async Task Tests_run_headless_requires_live_not_fake_job()
     {
         var host = new InMemoryEditorHost();
         var rt = new ComdrRuntime(host);
         Assert.True(rt.Registry.LoadSkill(SampleSkills.TestingSkillId));
 
         var started = await rt.Registry.CallAsync("tests_run", Obj(("mode", "EditMode")));
-        Assert.False(started.IsError, started.Content);
-        Assert.Contains("jobId", started.Content);
-        Assert.Contains("status", started.Content);
-
-        using var startDoc = JsonDocument.Parse(started.Content);
-        var jobId = startDoc.RootElement.GetProperty("data").GetProperty("jobId").GetString();
-        Assert.False(string.IsNullOrWhiteSpace(jobId));
-
-        var status = await rt.Registry.CallAsync("tests_status", Obj(("jobId", jobId!)));
-        Assert.False(status.IsError, status.Content);
-        Assert.Contains("results", status.Content);
-        Assert.Contains("Console_NoErrors", status.Content);
-        Assert.Contains("\"status\":\"completed\"", status.Content.Replace(" ", ""));
+        Assert.True(started.IsError, "headless tests_run must not fake a completed TestRunner job");
+        Assert.Contains("requires_live", started.Content, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Console_NoErrors", started.Content);
     }
 
     private static JsonObject Obj(params (string k, object v)[] pairs)
